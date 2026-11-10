@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Krillionbench admin</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/styles.css"><link rel="stylesheet" href="/admin/admin.css">
+<script src="/admin/admin.js" defer></script>
+</head>
+<body>
+<main class="board">
+<header class="head">
+<h1 class="label rule">Krillionbench admin</h1>
+<a class="btn" href="/">Board</a>
+</header>
+<p class="meta" id="who">Checking sign-in…</p>
+<p class="flash" id="flash" role="status" hidden></p>
+
+<section class="panel admin-section" aria-labelledby="run-title">
+<h2 class="label" id="run-title">Run now</h2>
+<div class="admin-row">
+<button class="btn" id="run-trial" type="button">Trial run</button>
+<span class="hint">Plays today's game with the checked models below (all enabled if none checked). Never ranked.</span>
+</div>
+<div class="admin-row">
+<label class="field"><span class="label">Day (ET)</span><input id="run-day" type="date"></label>
+<button class="btn" id="run-day-btn" type="button">Run day</button>
+<span class="hint">The real ranked batch for that day, same as the midnight cron. No-op if it already ran.</span>
+</div>
+</section>
+
+<section class="panel admin-section" aria-labelledby="models-title">
+<div class="admin-row spread">
+<h2 class="label" id="models-title">Models</h2>
+<button class="btn" id="save" type="button" disabled>Save roster</button>
+</div>
+<table class="admin-table">
+<thead><tr><th>Trial</th><th>Model</th><th>Label</th><th>On</th><th>Vision</th><th>Thinking</th><th></th></tr></thead>
+<tbody id="models"></tbody>
+</table>
+<div class="admin-row add">
+<label class="field grow"><span class="label">Add Workers AI model</span><select id="catalog"><option value="">Loading catalog…</option></select></label>
+<label class="field"><span class="label">Label</span><input id="add-label" type="text" autocomplete="off" spellcheck="false"></label>
+<button class="btn" id="add" type="button">Add</button>
+</div>
+<p class="hint">Changes apply to the next run once saved. Models without tool calling are listed last; they can be added but will likely score 0.</p>
+</section>
+
+<section class="panel admin-section" aria-labelledby="batches-title">
+<div class="admin-row spread">
+<h2 class="label" id="batches-title">Recent batches</h2>
+<button class="btn" id="refresh" type="button">Refresh</button>
+</div>
+<ol class="batches" id="batches"></ol>
+</section>
+</main>
+</body>
+</html>

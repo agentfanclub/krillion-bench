@@ -1,0 +1,43 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "krillion-bench",
+  "main": "src/worker.ts",
+  "account_id": "b8a6047310bbd4b0a0e5374e91089308",
+  "compatibility_date": "2026-11-10",
+  "compatibility_flags": ["nodejs_compat"],
+  "upload_source_maps": true,
+  "observability": { "enabled": true },
+  "limits": { "cpu_ms": 300000 },
+  // Leaderboard frontend (public/) served from the same Worker; /api/* and /admin* hit the Worker first.
+  "assets": { "directory": "./public", "binding": "ASSETS", "run_worker_first": ["/api/*", "/admin", "/admin/*"] },
+  // Cloudflare Access app "krillion-bench admin" protects <host>/admin; the Worker re-checks its token.
+  "vars": {
+    "ACCESS_TEAM_DOMAIN": "https://adhi-thirumala.cloudflareaccess.com",
+    "ACCESS_AUD": "3e841e752d8d433901699961c4d6d841d4b0d8c851608b6f6b6f18041e943874",
+    "ADMIN_EMAILS": "adhi.thirumala@gmail.com"
+  },
+  "triggers": {
+    // Krillion resets at 00:00 America/New_York. Workers cron is UTC-only, so fire at
+    // both possible UTC hours (EDT = 04:05, EST = 05:05); the handler keeps the one
+    // where it is 00:xx in New York.
+    "crons": ["5 4 * * *", "5 5 * * *"]
+  },
+  "ai": { "binding": "AI" },
+  "browser": { "binding": "BROWSER" },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "krillion-bench",
+      "database_id": "df640cba-0fe8-483f-b179-132aa895ea7e",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "kv_namespaces": [{ "binding": "CONFIG", "id": "e0138a87a3ad420c84656f535c72b9f4" }],
+  "durable_objects": {
+    "bindings": [
+      { "name": "DIVE_AGENT", "class_name": "DiveAgent" },
+      { "name": "DAY_COORDINATOR", "class_name": "DayCoordinator" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["DiveAgent", "DayCoordinator"] }]
+}

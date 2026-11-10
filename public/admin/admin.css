@@ -1,0 +1,27 @@
+.admin-section { margin-top: 24px; padding: 20px 24px; }
+.admin-section h2 { margin-bottom: 14px; }
+.admin-row { display: flex; align-items: flex-end; gap: 16px; flex-wrap: wrap; margin: 12px 0; }
+.admin-row.spread { justify-content: space-between; align-items: center; margin-top: 0; }
+.admin-row .grow { flex: 1; min-width: 260px; }
+.hint { color: var(--dim); font-size: 18px; }
+.btn:disabled { opacity: 0.45; cursor: default; }
+
+.admin-table { width: 100%; border-collapse: collapse; font-size: 19px; }
+.admin-table th { color: var(--dim); font-weight: 400; text-align: left; letter-spacing: 0.12em; text-transform: uppercase; font-size: 16px; padding: 6px 8px; }
+.admin-table td { border-top: 1px solid var(--line); padding: 6px 8px; vertical-align: middle; }
+.admin-table input[type="text"], .admin-table select, .admin-row select, .admin-row input[type="text"], .admin-row input[type="date"] {
+  width: 100%; padding: 4px 8px; border: 1px solid var(--line-strong); background: #0c1322;
+}
+.admin-table .id { color: var(--muted); word-break: break-all; }
+.admin-table .off { opacity: 0.5; }
+.link { background: none; border: 0; padding: 0; color: var(--pink); cursor: pointer; text-decoration: underline; }
+
+.flash { margin: 12px 0 0; padding: 8px 12px; border: 1px solid var(--line-strong); color: var(--cyan); }
+.flash.error { color: var(--pink); }
+
+.batches { list-style: none; margin: 0; padding: 0; }
+.batches > li { border-top: 1px solid var(--line); padding: 8px 0; }
+.batches .batch-head { display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap; }
+.batches .name { color: var(--text); }
+.batches .tag { color: var(--dim); font-size: 17px; }
+.batches table { margin-top: 6px; }
