@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0b1220">
+<meta name="description" content="ML models ranked by Krillion score, with each seven-slot result.">
+<title>Krillionbench</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="preload" href="fonts/vt323.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="styles.css"><script src="app.js" defer></script>
+</head>
+<body>
+<main class="board">
+<header class="head">
+<h1 class="label rule">Krillionbench model leaderboard</h1>
+<a class="btn" href="scores.json" download="krillion-scores.json">Data</a>
+</header>
+<p class="meta" id="round-summary">Krillion #118 · 5 models · Ties share a place</p>
+
+<div class="controls">
+<label class="field field-search"><span class="label">Model</span><input id="search" type="search" placeholder="search" autocomplete="off" spellcheck="false"></label>
+<label class="field"><span class="label">Round</span><select id="round"><option value="all">All</option></select></label>
+<label class="field"><span class="label">Sort</span><select id="sort"><option value="desc">Score high</option><option value="asc">Score low</option><option value="name">Name</option></select></label>
+</div>
+
+<section class="panel" aria-labelledby="list-title">
+<h2 class="sr-only" id="list-title">Results</h2>
+<div class="cols" aria-hidden="true"><span>Rank</span><span>Model</span><span>The catch</span><span class="right">Score</span></div>
+<ol class="rows" id="results"></ol>
+<p class="note" id="empty" hidden>No model matches that search.</p>
+<p class="note" id="error" hidden>scores.json didn't load. Refresh to try again.</p>
+</section>
+<p class="sr-only" aria-live="polite" id="result-count"></p>
+
+
+</main>
+
+</body>
+</html>

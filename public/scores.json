@@ -1,0 +1,100 @@
+{
+  "benchmark": "Krillion",
+  "results": [
+    {
+      "id": "gpt-6-astra",
+      "model": "GPT 6 Astra",
+      "round": 118,
+      "score": 595,
+      "emojis": [
+        "🏮",
+        "🏮",
+        "🏮",
+        "🏮",
+        "🏮",
+        "🏮",
+        "🏮"
+      ],
+      "source": "sources/result-1.png"
+    },
+    {
+      "id": "gpt-6-1-sol",
+      "model": "GPT 6.1 Sol",
+      "round": 118,
+      "score": 570,
+      "emojis": [
+        "🏮",
+        "🏮",
+        "🏮",
+        "🏮",
+        "🏮",
+        "🦑",
+        "🏮"
+      ],
+      "source": "sources/result-1.png"
+    },
+    {
+      "id": "fable-5-2",
+      "model": "Fable 5.2",
+      "round": 118,
+      "score": 520,
+      "emojis": [
+        "🏮",
+        "🦑",
+        "🏮",
+        "🏮",
+        "🏮",
+        "🦑",
+        "🦑"
+      ],
+      "source": "sources/result-4.png"
+    },
+    {
+      "id": "opus-5-5",
+      "model": "Opus 5.5",
+      "round": 118,
+      "score": 490,
+      "emojis": [
+        "🐟",
+        "🦑",
+        "🦑",
+        "🏮",
+        "🏮",
+        "🏮",
+        "🏮"
+      ],
+      "source": "sources/result-3.png"
+    },
+    {
+      "id": "deepseek-v4-1-flash",
+      "model": "DeepSeek v4.1 Flash",
+      "round": 118,
+      "score": 410,
+      "emojis": [
+        null,
+        "🦑",
+        "🦑",
+        "🏮",
+        "🏮",
+        "🦑",
+        "🦑"
+      ],
+      "source": "sources/result-2.png"
+    },
+    {
+      "id": "glm-5-3",
+      "model": "GLM-5.3",
+      "round": 118,
+      "score": 355,
+      "emojis": [
+        "🐟",
+        "🦑",
+        "⬛",
+        "🦑",
+        "🦑",
+        "🦑",
+        "🏮"
+      ]
+    }
+  ]
+}
