@@ -9,7 +9,7 @@ interface __BaseEnv_Env {
 	ASSETS: Fetcher;
 	ACCESS_TEAM_DOMAIN: "https://adhi-thirumala.cloudflareaccess.com";
 	ACCESS_AUD: "3e841e752d8d433901699961c4d6d841d4b0d8c851608b6f6b6f18041e943874";
-	ADMIN_EMAILS: "adhi.thirumala@gmail.com";
+	ADMIN_EMAILS: "adhi.thirumala@gmail.com,hello@agentfanclub.org";
 	DIVE_AGENT: DurableObjectNamespace<import("./src/worker").DiveAgent>;
 	DAY_COORDINATOR: DurableObjectNamespace<import("./src/worker").DayCoordinator>;
 }
