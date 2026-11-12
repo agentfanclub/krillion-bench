@@ -10,6 +10,34 @@ function el(tag, className, text) {
   return node;
 }
 
+function slot(emoji) {
+  const miss = emoji === '⬛';
+  const node = el('span', 'slot' + (miss ? ' empty' : ''), miss ? '' : emoji);
+  node.setAttribute('aria-hidden', 'true');
+  return node;
+}
+
+const missText = { timed_out: 'timed out', not_reached: 'not reached' };
+
+// The model's answer to each prompt, shown when the row is expanded.
+function answers(result) {
+  const list = el('ol', 'answers');
+  (result.answers || []).forEach((a, i) => {
+    const item = el('li', 'answer');
+    const emoji = result.emojis[i] || '⬛';
+    const text = el('div', 'answer-text');
+    text.append(el('span', 'prompt', a.prompt));
+    const given = a.answer ?? missText[a.outcome] ?? a.outcome;
+    text.append(el('span', 'given' + (a.outcome === 'accepted' ? '' : ' missed'), given));
+    const tries = a.attempts > 1 ? ` · ${a.attempts} tries` : '';
+    text.append(el('span', 'tier', `${labels[emoji] || 'unknown'}${tries}`));
+    item.append(slot(emoji), text, el('span', 'points', `+${a.score}`));
+    list.append(item);
+  });
+  if (!list.children.length) list.append(el('li', 'answer none', 'No answers recorded.'));
+  return list;
+}
+
 function render() {
   const query = $('search').value.trim().toLowerCase();
   const round = $('round').value;
@@ -21,23 +49,23 @@ function render() {
   $('results').replaceChildren(...visible.map(result => {
     // Rank within the result's own day, as the server ranked it.
     const rank = result.rank;
-    const row = el('li', 'row' + (rank === 1 ? ' first' : ''));
-    row.append(el('span', 'rank', `#${rank}`));
+    // The top five get the big rows; everyone below is compact.
+    const row = el('li', 'row' + (rank === 1 ? ' first' : '') + (rank > 5 ? ' compact' : ''));
+    const details = el('details');
+    const summary = el('summary', 'line');
+    summary.append(el('span', 'rank', `#${rank}`));
 
     const who = el('div', 'who');
     who.append(el('span', 'model', result.model), el('span', 'model-id', result.modelId));
-    row.append(who);
+    summary.append(who);
 
     const slots = el('div', 'slots');
     slots.setAttribute('role', 'img');
     slots.setAttribute('aria-label', result.emojis.map(e => labels[e] || 'unknown').join(', '));
-    for (const emoji of result.emojis) {
-      const miss = emoji === '⬛';
-      const slot = el('span', 'slot' + (miss ? ' empty' : ''), miss ? '' : emoji);
-      slot.setAttribute('aria-hidden', 'true');
-      slots.append(slot);
-    }
-    row.append(slots, el('span', 'score', String(result.score)));
+    for (const emoji of result.emojis) slots.append(slot(emoji));
+    summary.append(slots, el('span', 'score', String(result.score)));
+    details.append(summary, answers(result));
+    row.append(details);
     return row;
   }));
 

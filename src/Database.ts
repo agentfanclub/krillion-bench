@@ -58,6 +58,16 @@ export const LeaderboardEntry = Schema.Struct({
   rank: Schema.Number,
   /** One per prompt in game order: the tier emoji, or ⬛ for a miss. */
   emojis: Schema.Array(Schema.String),
+  /** One per prompt in game order, matching `emojis`. */
+  answers: Schema.Array(
+    Schema.Struct({
+      prompt: Schema.String,
+      outcome: Schema.String,
+      answer: Schema.NullOr(Schema.String),
+      score: Schema.Number,
+      attempts: Schema.Number,
+    }),
+  ),
 });
 export type LeaderboardEntry = typeof LeaderboardEntry.Type;
 
@@ -70,7 +80,15 @@ const ScoreRow = Schema.Struct({
   dayNumber: Schema.Number,
   label: Schema.String,
 });
-const ResultTierRow = Schema.Struct({ runId: Schema.String, tier: Schema.NullOr(Schema.String), outcome: Schema.String });
+const ResultRow = Schema.Struct({
+  runId: Schema.String,
+  tier: Schema.NullOr(Schema.String),
+  outcome: Schema.String,
+  text: Schema.String,
+  answer: Schema.NullOr(Schema.String),
+  score: Schema.Number,
+  attempts: Schema.Number,
+});
 
 /** Krillion's own share emojis (from the game bundle's TIERS / MISS_EMOJI). */
 const TIER_EMOJI: Readonly<Record<string, string>> = {
@@ -252,15 +270,16 @@ export class Database extends Context.Service<Database>()("krillion/Database", {
           WHERE ds.day >= ${since}`.pipe(rows(ScoreRow));
         if (scores.length === 0) return [];
         // Join through daily_scores rather than an IN list: D1 caps bound parameters at 100.
-        const results = yield* sql`SELECT r.run_id, r.tier, r.outcome
+        const results = yield* sql`SELECT r.run_id, r.tier, r.outcome, p.text, r.answer, r.score, r.attempts
           FROM daily_scores ds
           JOIN results r ON r.run_id = ds.run_id
           JOIN prompts p ON p.day = r.day AND p.prompt_id = r.prompt_id
           WHERE ds.day >= ${since}
-          ORDER BY r.run_id, p.position`.pipe(rows(ResultTierRow));
-        const emojis = Arr.groupBy(results, (r) => r.runId);
-        return scores.map(
-          (r): LeaderboardEntry => ({
+          ORDER BY r.run_id, p.position`.pipe(rows(ResultRow));
+        const byRun = Arr.groupBy(results, (r) => r.runId);
+        return scores.map((r): LeaderboardEntry => {
+          const prompts = byRun[r.runId] ?? [];
+          return {
             id: r.runId,
             model: r.label,
             modelId: r.modelId,
@@ -268,11 +287,18 @@ export class Database extends Context.Service<Database>()("krillion/Database", {
             round: r.dayNumber,
             score: r.totalScore,
             rank: r.rank,
-            emojis: (emojis[r.runId] ?? []).map((x) =>
+            emojis: prompts.map((x) =>
               x.outcome === "accepted" && x.tier !== null ? (TIER_EMOJI[x.tier] ?? MISS_EMOJI) : MISS_EMOJI,
             ),
-          }),
-        );
+            answers: prompts.map((x) => ({
+              prompt: x.text,
+              outcome: x.outcome,
+              answer: x.answer,
+              score: x.score,
+              attempts: x.attempts,
+            })),
+          };
+        });
       }),
     };
   }),
