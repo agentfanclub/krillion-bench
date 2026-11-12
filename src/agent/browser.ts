@@ -1,13 +1,49 @@
 import puppeteer, { type Browser as PptrBrowser, type BrowserWorker, type Page } from "@cloudflare/puppeteer";
 import type { Browser } from "agents/browser";
-import { GameState, SubmitRequest, SubmitResponse } from "../domain";
-import type { SubmissionRow } from "../services";
-import { Schema } from "effect";
+import { Option, Schema } from "effect";
+import { KRILLION_ORIGIN, type Submission } from "../domain";
 
 const TARGET_KEY = "browser:targetId";
 const SUBMIT_PATH = "/api/submit";
+const GAME_STORAGE_KEY = "krillion:game:v1";
+/** Each prompt's answer clock, in ms. */
+const ANSWER_WINDOW_MS = 25_000;
 
-export interface CapturedSubmission extends Omit<SubmissionRow, "runId" | "day"> {
+/** The page's `localStorage["krillion:game:v1"]`, the parts we read. */
+export const GameState = Schema.Struct({
+  date: Schema.optional(Schema.String),
+  roundIndex: Schema.optional(Schema.Number),
+  results: Schema.optional(
+    Schema.Array(
+      Schema.Struct({
+        promptId: Schema.String,
+        answer: Schema.optional(Schema.NullOr(Schema.String)),
+        tier: Schema.optional(Schema.NullOr(Schema.String)),
+        score: Schema.optional(Schema.NullOr(Schema.Number)),
+      }),
+    ),
+  ),
+});
+export type GameState = typeof GameState.Type;
+
+/** POST https://krillion.io/api/submit request body, as the page sends it. */
+const SubmitRequest = Schema.Struct({ date: Schema.String, promptId: Schema.String, answer: Schema.String });
+
+/** POST /api/submit response: `{accepted:false}`, `{accepted:true, answer, tier, score}`, or `{correction}`. */
+const SubmitResponse = Schema.Struct({
+  accepted: Schema.optional(Schema.Boolean),
+  answer: Schema.optional(Schema.String),
+  tier: Schema.optional(Schema.String),
+  score: Schema.optional(Schema.Number),
+  correction: Schema.optional(Schema.String),
+});
+
+const decodeGameState = Schema.decodeUnknownOption(Schema.fromJsonString(GameState));
+const decodeSubmitRequest = Schema.decodeUnknownOption(Schema.fromJsonString(SubmitRequest));
+const decodeSubmitResponse = Schema.decodeUnknownOption(Schema.fromJsonString(SubmitResponse));
+const decodeTargetId = Schema.decodeUnknownOption(Schema.String);
+
+export interface CapturedSubmission extends Omit<Submission, "runId" | "day"> {
   /** The game day the page submitted for; other modes (Unlimited, archive) carry other dates. */
   readonly date: string;
 }
@@ -49,10 +85,10 @@ export class RunPage {
   async #connect(): Promise<Page> {
     const { sessionId } = await this.browser.resolve();
     const pptr = await puppeteer.connect(this.binding, sessionId);
-    const wanted = await this.storage.get<string>(TARGET_KEY);
+    const wanted = decodeTargetId(await this.storage.get(TARGET_KEY));
     let page: Page | undefined;
     for (const p of await pptr.pages()) {
-      if (wanted && (await targetId(p)) === wanted) page = p;
+      if (Option.isSome(wanted) && (await targetId(p)) === wanted.value) page = p;
     }
     if (!page) {
       page = await pptr.newPage();
@@ -66,13 +102,10 @@ export class RunPage {
   }
 
   /** The game's own record of this player's dive (`localStorage["krillion:game:v1"]`). */
-  async gameState(): Promise<GameState | undefined> {
+  async gameState(): Promise<Option.Option<GameState>> {
     const page = await this.page();
-    if (!page.url().startsWith("https://krillion.io")) return undefined;
-    const raw = await page.evaluate<[], () => string | null>(`localStorage.getItem("krillion:game:v1")`);
-    if (!raw) return undefined;
-    const state = Schema.decodeUnknownOption(Schema.fromJsonString(GameState))(raw);
-    return state._tag === "Some" ? state.value : undefined;
+    if (!page.url().startsWith(KRILLION_ORIGIN)) return Option.none();
+    return decodeGameState(await page.evaluate<[], () => string | null>(`localStorage.getItem("${GAME_STORAGE_KEY}")`));
   }
 
   /** Drop the connection (not the browser). */
@@ -106,7 +139,7 @@ function attachCapture(page: Page, onSubmission: (s: CapturedSubmission) => void
     // Read the answer clock as the request leaves; the game clears it once answered.
     const clock = page
       .evaluate<[], () => number | null>(`(() => {
-        const raw = localStorage.getItem("krillion:game:v1");
+        const raw = localStorage.getItem("${GAME_STORAGE_KEY}");
         const ends = raw ? JSON.parse(raw).answerEndsAt : null;
         return typeof ends === "number" ? ends : null;
       })()`)
@@ -118,19 +151,12 @@ function attachCapture(page: Page, onSubmission: (s: CapturedSubmission) => void
     const req = res.request();
     const start = started.get(req);
     if (!start) return;
-    const body = Schema.decodeUnknownOption(Schema.fromJsonString(SubmitRequest))(req.postData() ?? "");
-    if (body._tag === "None") return;
+    const body = decodeSubmitRequest(req.postData() ?? "");
+    if (Option.isNone(body)) return;
     const status = res.status();
-    let parsed: SubmitResponse | undefined;
-    try {
-      const json = (await res.json()) as unknown;
-      const decoded = Schema.decodeUnknownOption(SubmitResponse)(json);
-      if (decoded._tag === "Some") parsed = decoded.value;
-    } catch {
-      parsed = undefined;
-    }
+    const parsed = Option.getOrUndefined(decodeSubmitResponse(await res.text().catch(() => "")));
     const endsAt = await start.clock;
-    const kind: CapturedSubmission["kind"] =
+    const kind: Submission["kind"] =
       status !== 200 || !parsed
         ? "error"
         : parsed.accepted === true
@@ -151,7 +177,7 @@ function attachCapture(page: Page, onSubmission: (s: CapturedSubmission) => void
       score: parsed?.score ?? null,
       httpStatus: status,
       latencyMs: Date.now() - start.at,
-      clockMs: endsAt === null ? null : start.at - (endsAt - 25_000),
+      clockMs: endsAt === null ? null : start.at - (endsAt - ANSWER_WINDOW_MS),
     });
   });
 }

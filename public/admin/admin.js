@@ -3,6 +3,8 @@ const THINKING = ['', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
 let roster = { version: 1, models: [] };
 let catalog = [];
 let dirty = false;
+// Saving replaces the whole KV document: never save over a roster we couldn't load.
+let rosterLoaded = false;
 
 function el(tag, props = {}, ...children) {
   const node = Object.assign(document.createElement(tag), props);
@@ -56,8 +58,8 @@ function renderCatalog() {
     .filter(c => !have.has(c.id))
     .sort((a, b) => Number(b.functionCalling) - Number(a.functionCalling) || a.id.localeCompare(b.id))
     .map(c => {
-      const notes = [c.functionCalling ? 'tools' : 'no tools', c.vision && 'vision', c.reasoning && 'reasoning',
-        c.deprecates && `deprecates ${c.deprecates}`].filter(Boolean).join(', ');
+      const notes = [c.source === 'ai-gateway' && 'AI Gateway, BYOK', c.functionCalling ? 'tools' : 'no tools',
+        c.vision && 'vision', c.reasoning && 'reasoning', c.deprecates && `deprecates ${c.deprecates}`].filter(Boolean).join(', ');
       return el('option', { value: c.id, textContent: `${c.id} (${notes})` });
     });
   $('catalog').replaceChildren(el('option', { value: '', textContent: 'Choose a model…' }), ...options);
@@ -70,6 +72,7 @@ $('catalog').addEventListener('change', () => {
 
 $('add').addEventListener('click', () => {
   const id = $('catalog').value;
+  if (!rosterLoaded) return flash('The roster did not load; fix it before editing.', true);
   if (!id) return flash('Pick a model to add.', true);
   const info = catalog.find(c => c.id === id);
   roster.models.push({ id, label: $('add-label').value.trim() || id, enabled: true, vision: !!info?.vision });
@@ -78,6 +81,7 @@ $('add').addEventListener('click', () => {
 });
 
 $('save').addEventListener('click', async () => {
+  if (!rosterLoaded) return flash('The roster did not load; fix it before saving.', true);
   try {
     const clean = { version: 1, models: roster.models.map(({ thinkingLevel, ...m }) => thinkingLevel ? { ...m, thinkingLevel } : m) };
     roster = await api('/models', { method: 'PUT', body: JSON.stringify(clean) });
@@ -120,10 +124,10 @@ async function showBatch(li, name) {
   try {
     const b = await api(`/batch?name=${encodeURIComponent(name)}`);
     const rows = b.runs.map(r => el('tr', {},
-      el('td', { className: 'id', textContent: r.model_id }),
+      el('td', { className: 'id', textContent: r.modelId }),
       el('td', { textContent: `#${r.attempt}` }),
       el('td', { textContent: r.status }),
-      el('td', { textContent: r.total_score ?? '–' })));
+      el('td', { textContent: r.totalScore ?? '–' })));
     li.append(el('table', { className: 'admin-table' },
       el('thead', {}, el('tr', {}, ...['Model', 'Try', 'Status', 'Score'].map(h => el('th', { textContent: h })))),
       el('tbody', {}, ...rows)));
@@ -139,8 +143,8 @@ async function loadBatches() {
       li.append(el('div', { className: 'batch-head' },
         el('button', { type: 'button', className: 'link name', textContent: b.batch, onclick: () => showBatch(li, b.batch) }),
         el('span', { className: 'tag', textContent: b.trial ? 'trial' : 'ranked' }),
-        el('span', { className: 'tag', textContent: `by ${b.created_by ?? '?'}` }),
-        el('span', { className: 'tag', textContent: new Date(b.created_at).toLocaleString() }),
+        el('span', { className: 'tag', textContent: `by ${b.createdBy ?? '?'}` }),
+        el('span', { className: 'tag', textContent: new Date(b.createdAt).toLocaleString() }),
         el('span', { className: 'tag phase', textContent: '' })));
       return li;
     }));
@@ -160,6 +164,7 @@ async function init() {
   } catch (e) { $('who').textContent = `Not authorized: ${e.message}`; return; }
   try {
     roster = await api('/models');
+    rosterLoaded = true;
     renderRoster();
   } catch (e) { flash(`Couldn't load roster: ${e.message}`, true); }
   try {

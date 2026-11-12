@@ -1,35 +1,30 @@
-import { Schema } from "effect";
+import { DateTime, Effect, Schema } from "effect";
+
+/** A calendar day in New York (Krillion's reset clock), `YYYY-MM-DD`. */
+export const Day = Schema.String.check(Schema.isPattern(/^\d{4}-\d{2}-\d{2}$/)).pipe(Schema.brand("Day"));
+export type Day = typeof Day.Type;
+
+const NewYork = DateTime.zoneMakeNamedUnsafe("America/New_York");
+
+export const eastern = (at: DateTime.DateTime): { readonly day: Day; readonly hour: number } => {
+  const local = DateTime.setZone(at, NewYork);
+  return { day: Day.make(DateTime.formatIsoDate(local)), hour: DateTime.toParts(local).hour };
+};
+
+export const easternToday: Effect.Effect<Day> = Effect.map(DateTime.now, (now) => eastern(now).day);
+
+export const KRILLION_ORIGIN = "https://krillion.io";
+
+export const Prompt = Schema.Struct({ id: Schema.String, text: Schema.String });
 
 /** GET https://krillion.io/api/today */
 export const TodayGame = Schema.Struct({
-  date: Schema.String,
+  date: Day,
   dayNumber: Schema.Number,
   resetsAt: Schema.String,
-  prompts: Schema.Array(Schema.Struct({ id: Schema.String, text: Schema.String })),
+  prompts: Schema.Array(Prompt),
 });
 export type TodayGame = typeof TodayGame.Type;
-
-/** POST https://krillion.io/api/submit request body (as the page sends it). */
-export const SubmitRequest = Schema.Struct({
-  date: Schema.String,
-  promptId: Schema.String,
-  answer: Schema.String,
-});
-
-/**
- * POST /api/submit response. Observed shapes:
- * `{accepted:false}`, `{accepted:true, answer, tier, score}`, `{correction}`.
- */
-export const SubmitResponse = Schema.Struct({
-  accepted: Schema.optional(Schema.Boolean),
-  answer: Schema.optional(Schema.String),
-  tier: Schema.optional(Schema.String),
-  score: Schema.optional(Schema.Number),
-  correction: Schema.optional(Schema.String),
-});
-export type SubmitResponse = typeof SubmitResponse.Type;
-
-export const ThinkingLevel = Schema.Literals(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 /** One roster entry in KV `models`. */
 export const ModelEntry = Schema.Struct({
@@ -37,67 +32,97 @@ export const ModelEntry = Schema.Struct({
   label: Schema.String,
   enabled: Schema.Boolean,
   vision: Schema.optional(Schema.Boolean),
-  thinkingLevel: Schema.optional(ThinkingLevel),
+  thinkingLevel: Schema.optional(Schema.Literals(["off", "minimal", "low", "medium", "high", "xhigh", "max"])),
 });
 export type ModelEntry = typeof ModelEntry.Type;
 
 /** KV key `models`. */
 export const ModelsDoc = Schema.Struct({
   version: Schema.Literal(1),
-  models: Schema.Array(ModelEntry),
+  models: Schema.Array(ModelEntry).check(
+    Schema.makeFilter((models) => new Set(models.map((m) => m.id)).size === models.length || "duplicate model id"),
+  ),
 });
 export type ModelsDoc = typeof ModelsDoc.Type;
 
-export const RunStatus = Schema.Literals([
-  "queued",
-  "running",
-  "completed",
-  "timed_out",
-  "failed",
-  "infra_error",
-  "aborted",
-]);
+export const TerminalStatus = Schema.Literals(["completed", "timed_out", "failed", "infra_error", "aborted"]);
+export type TerminalStatus = typeof TerminalStatus.Type;
+export const RunStatus = Schema.Union([Schema.Literals(["queued", "running"]), TerminalStatus]);
 export type RunStatus = typeof RunStatus.Type;
+export const isTerminal = Schema.is(TerminalStatus);
 
-export const TERMINAL: Record<RunStatus, boolean> = {
-  queued: false,
-  running: false,
-  completed: true,
-  timed_out: true,
-  failed: true,
-  infra_error: true,
-  aborted: true,
-};
+/** What a batch is asked to do. */
+export const BatchRequest = Schema.Struct({
+  /** ET day for real runs. Trials take whatever day the site is on. */
+  day: Schema.NullOr(Day),
+  trial: Schema.Boolean,
+  /** Restrict to these roster ids (trials). */
+  models: Schema.NullOr(Schema.Array(Schema.String)),
+  /** "cron" or the admin's email. */
+  createdBy: Schema.String,
+});
+export type BatchRequest = typeof BatchRequest.Type;
 
-/** What the coordinator hands a DiveAgent. Stored in the agent's own storage. */
+export const BatchConfig = Schema.Struct({ ...BatchRequest.fields, createdAt: Schema.Number });
+export type BatchConfig = typeof BatchConfig.Type;
+
+/** What the coordinator hands a DiveAgent. */
 export const RunInput = Schema.Struct({
   runId: Schema.String,
   batch: Schema.String,
-  day: Schema.String,
+  day: Day,
   attempt: Schema.Number,
   trial: Schema.Boolean,
   model: ModelEntry,
-  prompts: Schema.Array(Schema.Struct({ id: Schema.String, text: Schema.String })),
+  prompts: Schema.Array(Prompt),
 });
 export type RunInput = typeof RunInput.Type;
 
-/** The page's `localStorage["krillion:game:v1"]`, the parts we read. */
-export const GameState = Schema.Struct({
-  date: Schema.optional(Schema.String),
-  roundIndex: Schema.optional(Schema.Number),
-  phase: Schema.optional(Schema.String),
-  answerEndsAt: Schema.optional(Schema.NullOr(Schema.Number)),
-  results: Schema.optional(
-    Schema.Array(
-      Schema.Struct({
-        promptId: Schema.String,
-        answer: Schema.optional(Schema.NullOr(Schema.String)),
-        tier: Schema.optional(Schema.NullOr(Schema.String)),
-        score: Schema.optional(Schema.NullOr(Schema.Number)),
-      }),
-    ),
-  ),
+/** One `/api/submit` exchange as captured from the network. */
+export const Submission = Schema.Struct({
+  runId: Schema.String,
+  seq: Schema.Number,
+  day: Schema.String,
+  promptId: Schema.String,
+  submittedAt: Schema.String,
+  rawAnswer: Schema.String,
+  kind: Schema.Literals(["accepted", "rejected", "correction", "error"]),
+  canonical: Schema.NullOr(Schema.String),
+  correction: Schema.NullOr(Schema.String),
+  tier: Schema.NullOr(Schema.String),
+  score: Schema.NullOr(Schema.Number),
+  httpStatus: Schema.Number,
+  latencyMs: Schema.Number,
+  clockMs: Schema.NullOr(Schema.Number),
 });
-export type GameState = typeof GameState.Type;
+export type Submission = typeof Submission.Type;
 
-export const ANSWER_WINDOW_MS = 25_000;
+/** Result per prompt of a finished run. */
+export const PromptResult = Schema.Struct({
+  promptId: Schema.String,
+  outcome: Schema.Literals(["accepted", "timed_out", "not_reached"]),
+  answer: Schema.NullOr(Schema.String),
+  tier: Schema.NullOr(Schema.String),
+  score: Schema.Number,
+  attempts: Schema.Number,
+  msToAccept: Schema.NullOr(Schema.Number),
+});
+export type PromptResult = typeof PromptResult.Type;
+
+/** Everything a finished run records. */
+export const RunSummary = Schema.Struct({
+  runId: Schema.String,
+  day: Day,
+  modelId: Schema.String,
+  status: TerminalStatus,
+  error: Schema.NullOr(Schema.String),
+  totalScore: Schema.Number,
+  steps: Schema.Number,
+  inputTokens: Schema.Number,
+  outputTokens: Schema.Number,
+  costUsd: Schema.NullOr(Schema.Number),
+  piOutcome: Schema.String,
+  selfReport: Schema.NullOr(Schema.String),
+  results: Schema.Array(PromptResult),
+});
+export type RunSummary = typeof RunSummary.Type;

@@ -9,6 +9,11 @@ Daily benchmark: every model in a KV list plays the Krillion Daily Dive (https:/
 - **Why that is simple:** Workers AI models go through `env.AI` with the account's existing `default` AI Gateway (authentication on, `workers_ai_billing_mode: postpaid`). No AI Gateway credits, no API keys, no secrets. Usage bills to the Workers plan.
 - **Plan check:** entitlements look like Workers Paid (`d1.max_databases=1000000`, `containers.enabled=true`), but the subscriptions endpoint returned 403, so confirm in the dashboard. It matters: on Workers Free, Browser Run is 3 concurrent browsers and 10 browser-minutes/day, which can't run this benchmark.
 - Existing resources in the account are unrelated (poker, 67dle, sisr, learnscrolling); this project adds its own D1 database `krillion-bench`, KV namespace `krillion-bench-config` (binding `CONFIG`), and Worker `krillion-bench`.
+- **Public URL:** `https://krillion.agentfan.club`. The zone `agentfan.club` is in the *agent fan club* account, so a plain CNAME/A record to the Worker can't work (cross-account CNAMEs fail with error 1014; hostnames route to the account that owns the zone). Instead `krillion.agentfan.club` is a **Cloudflare for SaaS custom hostname on `realartists.work`** (personal account; fallback origin `saas.realartists.work`, proxied `AAAA 100::`), and the Worker has the route `krillion.agentfan.club/*` on that zone. The only records in agentfan.club: DNS-only `CNAME krillion → saas.realartists.work` and `TXT _cf-custom-hostname.krillion` (ownership). `/admin` there returns 403 (no Access app on that host); the admin portal stays on `krillion-bench.adhi-thirumala.workers.dev/admin`.
+- **AI Gateway:** dedicated gateway `krillion-bench` (authentication on, logs on, cache off, `workers_ai_billing_mode: postpaid`), set via the `AI_GATEWAY` var. Workers AI models bill postpaid as before. Anthropic, OpenAI and Google AI Studio models use **BYOK keys stored on this gateway under the `default` alias**; the AI binding only consults that alias. Without a key the gateway falls back to unified billing and fails with 402 "Insufficient balance" (balance is $0), so those runs end `infra_error` with score 0. The roster carries every catalog model that answered a one-turn tool-call probe through the gateway on 2026-11-10: 14 Claude, 21 OpenAI, 17 Google (Gemini 3.x/4, Gemma 4). Dropped: `gpt-4.1-nano` (retired), `o3-mini`/`o4-mini` (no access on this key), `gpt-5.4-pro`/`gpt-5.5-pro` (3 RPM org limit: a dive needs far more), Gemini 2.5 (closed to new users), Deep Research (Interactions API only), Gemini 2.5 Computer Use (requires its own tool). Disabled: `google/gemma-4-31b-it` and `google/gemma-4-26b-a4b-it` (AI Studio Tier 1 caps Gemma at 16k input tokens/min; a dive exceeds it in the first minute). Provider rate limits as of 2026-11-10: Anthropic 4,000 RPM / 2M ITPM; OpenAI org on the Free tier (50 RPD, 3 RPM, 10k TPM on flagship models) despite $50 of credit purchases, escalated to OpenAI support. The admin picker lists every catalog model with its price.
+- **Gemini route:** `agents/models/pi-ai` sends only Anthropic/OpenAI wire formats to the gateway, so roster ids `google/<id>` resolve (`src/agent/gateway.ts`) to Pi's Google catalog entry re-pointed at Google's OpenAI-compatible endpoint (`generativelanguage.googleapis.com/v1beta/openai`, which the gateway maps to `google-ai-studio`). A wrapper on the AI binding's gateway `fetch` fixes two incompatibilities: Gemini 3+ rejects replayed tool calls without their `thought_signature` (`extra_content.google`), which Pi drops, so signatures are captured by tool-call id from the stream and re-attached (Google's documented skip value if an isolate restart lost one); and streamed tool-call deltas carry no `index`, which would merge parallel calls.
+- **Models newer than Pi's catalog:** `src/agent/gateway.ts` has two small tables. `GOOGLE_EXTRA` lists Gemini models Google serves that Pi AI 1.5.2 doesn't know (limits from Google's `models.get`; no published price, so cost records as $0): `gemini-4-carbon`. `CATALOG_EXTRA` lists AI Gateway catalog models Pi doesn't know, built as a copy of the nearest listed sibling under the vendor's id and sent over the provider-native path (BYOK pays): `anthropic/claude-fable-5.2` (copy of Fable 5.1, price assumed equal).
+- **Full AI Gateway catalog check (2026-11-11):** every text-generation model on developers.cloudflare.com/ai/models that isn't in the roster got a one-call tool probe through `krillion-bench`. Only `anthropic/claude-fable-5.2`, `openai/gpt-5.4-pro` and `openai/gpt-5.5-pro` answered (the Pro models stay out: 3 RPM on the OpenAI Free tier). Every other provider in the catalog (xAI Grok, Alibaba Qwen, Moonshot Kimi K3, MiniMax M3, Meta Muse, DeepSeek V4 Pro, Thinking Machines, Reflection, Particle, Fireworks, Unbiased, and the catalog's `google/*` ids) returns 402: they bill through Unified Billing credits (balance $0) unless that provider's key is added as BYOK. `openai/gpt-4.1-nano`, `o3-mini`, `o4-mini` are retired (410); `minimax/m2.7`, `m3.1-flash`, `xai/grok-4.20-multi-agent`, `typesafe/jev*`, `openai/decisions` reject chat tool calls.
 
 ## 1. What we are measuring (observed facts about the game)
 
@@ -111,9 +116,9 @@ Why the rest of the shape:
 
 Excluded, not chat LLMs: `@cf/meta/llama-guard-3-8b` (safety classifier), `@cf/cloudflare/clef`, `clef-flash`, `clef-omni` (decision models that answer typed question schemas), `@cf/cloudflare/clairic` (extraction/forecast model).
 
-**Deprecation cliff:** 15 roster models are scheduled for removal on **2026-11-20** (kimi-k2.6, kimi-k2.7-code, glm-5.3-flash, glm-5.2, deepseek-v4-flash/pro, nemotron-3-120b, qwen3-30b, qwq-32b, deepseek-r1-distill-qwen-32b, llama-3.1-8b-fp8, llama-3.2-1b/3b, gemma-2b/7b lora, llama-2-7b lora). They run until then; afterwards their runs end `infra_error` (score 0) until disabled in the admin portal. The `models` table keeps their history.
+**Deprecation cliff:** 16 Workers AI models are scheduled for removal on **2026-11-20** (kimi-k2.6, kimi-k2.7-code, glm-5.3-flash, glm-5.2, deepseek-v4-flash/pro, nemotron-3-120b, qwen3-30b, qwq-32b, deepseek-r1-distill-qwen-32b, llama-3.1-8b-fp8, llama-3.2-1b/3b, gemma-2b/7b lora, llama-2-7b lora). They are disabled in the roster since 2026-11-10 (kept in KV, so they can be re-enabled until removal); the `models` table keeps their history.
 
-Third-party models come back later with no structural change: Pi AI's gateway catalog has Anthropic (`anthropic-messages`) and OpenAI (`openai-responses`) routed natively; others need a Pi AI model object (§6). They need either AI Gateway credits (unified billing) or BYOK keys stored on the gateway.
+Third-party models need no structural change: Pi AI's gateway catalog has Anthropic (`anthropic-messages`) and OpenAI (`openai-responses`) routed natively; Gemini goes through the compat route in §0. All use BYOK keys on the gateway.
 
 ## 3. Daily flow
 
@@ -193,7 +198,7 @@ One D1 database (`krillion-bench`). "Game", "answers", and "results" are separat
 
 Schema: [`migrations/0001_init.sql`](../migrations/0001_init.sql) (applied to D1 `krillion-bench`). Tables: `games`, `prompts` (what the game was), `submissions` (every answer typed, including rejects and corrections), `results` (one row per run × prompt: the leaderboard grain), `runs`, `models`, `daily_scores`.
 
-Rules: `results` always gets 7 rows per finished run (missing prompts = `timed_out` or `not_reached`, score 0), so averages never silently skip categories. Exactly one attempt per (day, model) is counted in `daily_scores`: the latest attempt that isn't `infra_error`, or, if every attempt was, the latest one with score 0, so every rostered model has a row. Trial batches (`runs.trial = 1`, batch `day#trial-…`) are never ranked.
+Rules: `results` always gets 7 rows per finished run (missing prompts = `timed_out` or `not_reached`, score 0), so averages never silently skip categories. Exactly one attempt per (day, model) is counted in `daily_scores`: the latest attempt that isn't `infra_error`, or, if every attempt was, the one that scored most (partial points from a rate-limited run still count), so every rostered model has a row. Trial batches (`runs.trial = 1`, batch `day#trial-…`) are never ranked.
 
 ### Cost: every query hits an index
 
@@ -236,18 +241,25 @@ Namespace `CONFIG`, key `models`:
 
 ## 7. Effect layout
 
-Effect 4.1 (stable): `effect/schema`, `effect/sql` + `@effect/sql-d1`, `effect/workflow` + `@effect/platform-cloudflare` (`CloudflareWorkflowEngine`, `CloudflareDurableObjects`). Pi owns the agent loop; Effect owns everything around it. Pi tool `execute` bodies are thin `runtime.runPromise(effect)` calls into Effect services, so retries, timeouts, and errors are typed there too.
+Effect 4.1 (stable): `effect/schema`, `effect/http-api`, `effect/http` (`HttpClient`), `effect/sql` + `@effect/sql-d1`. Pi owns the agent loop; Effect owns everything around it. Every external value (Krillion API, KV roster, D1 rows, DO storage and jobs, request bodies, provider stream events, page state) is decoded with `Schema`, and each schema lives with the module that owns the data. Services (`Database`, `Roster`, `Krillion`, `Objects`, `WorkerEnv`) are `Context.Service`s composed in `AppLayer`; one `AppRuntime` per isolate serves the cron, both DOs, and (through its memo map) the HTTP handler.
 
 ```
 src/
-  worker.ts            routes: /admin* → admin.ts, /api/scores (cached), else static assets; scheduled (DST gate); exports DOs
-  admin.ts             Access-gated admin API: roster CRUD (KV), Workers AI catalog, trigger trial/day runs, batch + agent status
-  clock.ts             New York date/hour
-  domain.ts            Schema: TodayGame, SubmitRequest/Response, ModelEntry/ModelsDoc, RunInput, GameState, RunStatus
-  services.ts          Effect: fetchToday/fetchGameFor, loadRoster (KV), D1 repos (SqlClient via @effect/sql-d1), finalizeDay, ManagedRuntime
-  coordinator.ts       DayCoordinator DO: dispatch / reconcile / deadline / force-close / finalize jobs
+  worker.ts            fetch → HttpApi web handler; scheduled (DST gate) → DayCoordinator; exports DOs
+  App.ts               AppLayer (+ sync scheduler), AppRuntime, durableObjectRunner (run / rpc / onJob for both DOs)
+  Cloudflare.ts        WorkerEnv service; stored() (schema-typed DO KV key); JobQueue (schema-typed Lifecycle jobs)
+  Logging.ts           Workers Logs logger (one object per line), clip, logRecovered
+  Objects.ts           DO RPC contract (schemas, decoded on the caller's side) and clients as Effects (RpcError), diveName
+  domain.ts            Shared schemas: Day (branded ET date), TodayGame, ModelsDoc, RunStatus, BatchConfig, RunInput, RunSummary
+  Database.ts          D1 repository service + row schemas (all queries; multi-statement writes in one D1 batch)
+  Roster.ts            KV roster service
+  Krillion.ts          /api/today over HttpClient with retry
+  http/Api.ts          HttpApi definition: public `GET /api/scores`; admin group under /admin/api with AdminAuth
+  http/server.ts       handlers, AdminAuth (Cloudflare Access JWT), EdgeCache (Cache API), static routes (/admin gated, /api/* fallback)
+  coordinator.ts       DayCoordinator DO: dispatch / reconcile / deadline / force-close / finalize jobs; rerun
   agent/
     DiveAgent.ts       DO: Lifecycle + Browser + PiHarness; begin / watch (nudges) / finalize jobs
+    gateway.ts         AI binding wrapper: logs every failed model call; Gemini model resolver + compat patches; admin catalog
     browser.ts         RunPage: Puppeteer over the SDK Browser's session; submit capture; game state
     tools.ts           Pi extension "browser": navigate, snapshot, click, type, press, wait, screenshot
     prompt.ts          PROMPT, NUDGE, PROMPT_VERSION
@@ -255,7 +267,9 @@ migrations/0001_init.sql
 config/models.json     seed for KV key `models`
 ```
 
-Conventions: external calls are `Effect`s with tagged errors (`KrillionError`, `ConfigError`, `SqlError`); Pi's run outcome (`done`, `turn_limit`, `model_error`, …) plus submission count decide `completed` / `failed` / `infra_error`. Finalize and abort always end in `browser.close()` (Browser Run bills until idle timeout otherwise).
+Conventions: external calls are `Effect`s with tagged errors (`KrillionError`, `RosterError`, `SqlError`, `RpcError`); the admin API answers errors as `{_tag, error}` (`BadRequest` 400 for undecodable requests, `Forbidden` 403, `Conflict` 409; anything else is a logged 500). Both DOs follow one shape: module-level Effects over a per-object context service (`Batch`, `Dive`), jobs decoded by `JobQueue` and dispatched exhaustively with `Match`, state read through `stored()` under the same keys as before. Pi's run outcome (`done`, `turn_limit`, `model_error`, …) plus submission count decide `completed` / `failed` / `infra_error`. Finalize and abort always end in `browser.close()` (Browser Run bills until idle timeout otherwise).
+
+Logging (Workers Logs, `observability.enabled`): every line is an object whose `message` is the event (`"ai gateway request failed"`, `"model request failed"`, `"dive finished with error"`, …) and whose other fields carry `runId`, `batch`, `modelId`, `attempt`, and for provider failures `provider`, `endpoint`, `status`, `gatewayLogId` (open it in the gateway's logs), `retryAfter`, the response body or the in-stream `providerError` (OpenAI and Anthropic report rate limits as error events inside an HTTP 200 stream). At finalize, the errors Pi recorded on assistant messages are logged and the last one becomes the run's `error`, so `failed` runs say why in the admin portal too.
 
 ## 8. Open decisions
 
@@ -281,6 +295,6 @@ Roster policy: any enabled model runs every day. A model that can't drive the to
 - **Site changes.** `/api/today` and `/api/submit` are undocumented. Schema decode failures should page us (fail the day) rather than store garbage. The agent itself only uses the UI, so UI changes are "part of the benchmark".
 - **We are real traffic to a solo developer's game.** ~N submissions/day per model show up in their stats and popularity data. Worth telling the developer, or capping roster size.
 - **Bot blocking.** A `403` from `/api/submit` (client shows a blocked state) or a challenge page → `infra_error`, one retry, then the day is flagged.
-- **Fairness of the clock.** Gateway queueing and provider latency count against the model. Intended (speed is part of the task), but gateway-side 429s are classified as infra so rate limits don't masquerade as model slowness.
+- **Fairness of the clock.** Gateway queueing and provider latency count against the model. Intended (speed is part of the task), but provider rate limits are classified as infra: a run that ends on a model error after any rate-limited call (HTTP 429, `rate_limit_exceeded`, `rate_limit_error`, `RESOURCE_EXHAUSTED`) is `infra_error` however many answers it submitted, and gets the one retry.
 - **Browser Run cost/limits.** Each run is ~3–5 browser-minutes; a dozen models/day is far below the Workers Paid defaults (200 concurrent, 3 launches/s). On Workers Free it would not run at all (§0).
 - **Workers AI catalog churn.** Models get deprecated on short notice (8 of the tool-calling models on 2026-11-20). Disable them in KV before they vanish; a run on a removed model ends `infra_error`.

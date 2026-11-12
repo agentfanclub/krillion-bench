@@ -1,6 +1,13 @@
 import type { ElementHandle, KeyInput, Page } from "@cloudflare/puppeteer";
 import type { Extension, ToolExecutionResult, ToolRegistration } from "@earendil-works/pi-durable";
-import { int, obj, opt, bool, str } from "@earendil-works/pi-schema";
+import { bool, int, obj, opt, str } from "@earendil-works/pi-schema";
+import { Schema } from "effect";
+
+/** A tool's validated arguments (pi-durable doesn't export `ToolArgs`). */
+type ArgsOf<P extends object> = Parameters<ToolRegistration<P>["execute"]>[0];
+
+/** An element inside `evaluate` callbacks: they run in the page, and the Worker's types have no DOM lib. */
+type PageElement = { click(): void; focus(): void; select?: () => void };
 
 /**
  * Generic page tools (not Krillion-specific). Every action returns a fresh
@@ -41,16 +48,17 @@ const SNAPSHOT_JS = `(() => {
   return { url: location.href, title: document.title, elements, text };
 })()`;
 
-interface Snapshot {
-  readonly url: string;
-  readonly title: string;
-  readonly elements: string[];
-  readonly text: string;
-}
+const Snapshot = Schema.Struct({
+  url: Schema.String,
+  title: Schema.String,
+  elements: Schema.Array(Schema.String),
+  text: Schema.String,
+});
+const decodeSnapshot = Schema.decodeUnknownSync(Snapshot);
 
 async function snapshotText(page: Page): Promise<string> {
   if (page.url() === "about:blank") return "URL: about:blank (empty page)";
-  const s = await page.evaluate<[], () => Snapshot>(SNAPSHOT_JS);
+  const s = decodeSnapshot(await page.evaluate<[], () => unknown>(SNAPSHOT_JS));
   const text = s.text.length > MAX_TEXT ? `${s.text.slice(0, MAX_TEXT)}\n…(truncated)` : s.text;
   return [
     `URL: ${s.url}`,
@@ -85,124 +93,121 @@ export interface BrowserToolsOptions {
   readonly onStep: () => void;
 }
 
-export function browserExtension(options: BrowserToolsOptions): Extension {
-  const { page: getPage, vision, onStep } = options;
-
-  /** Errors go back to the model as tool errors it can react to, with the page state. */
-  const run =
-    <A>(fn: (page: Page, args: A) => Promise<ToolExecutionResult>) =>
-    async (args: A): Promise<ToolExecutionResult> => {
+export function browserExtension({ page: getPage, vision, onStep }: BrowserToolsOptions): Extension {
+  /**
+   * A tool on the run's one tab: runs alone, counts as a step, and returns errors to the
+   * model as tool errors it can react to, with the page state.
+   */
+  const pageTool = <P extends object>(spec: {
+    readonly name: string;
+    readonly description: string;
+    readonly parameters: P;
+    /** Safe to rerun after an interruption (read-only, or idempotent). */
+    readonly replay?: "safe";
+    readonly run: (page: Page, args: ArgsOf<P>) => Promise<ToolExecutionResult>;
+  }): ToolRegistration<P> => ({
+    name: spec.name,
+    description: spec.description,
+    parameters: spec.parameters,
+    replay: spec.replay,
+    executionMode: "sequential",
+    execute: async (args) => {
       onStep();
       const page = await getPage();
       try {
-        return await fn(page, args);
+        return await spec.run(page, args);
       } catch (e) {
         const snap = await snapshotText(page).catch(() => "(page unavailable)");
         return { output: [{ type: "text", text: `Error: ${e instanceof Error ? e.message : String(e)}\n\n${snap}` }], isError: true };
       }
-    };
-
-  const NavigateArgs = obj({ url: str({ description: "Absolute http(s) URL" }) });
-  const navigate: ToolRegistration<typeof NavigateArgs> = {
-    name: "navigate",
-    description: "Open a URL in the browser tab and return a snapshot of the page.",
-    parameters: NavigateArgs,
-    replay: "safe",
-    executionMode: "sequential",
-    execute: run(async (page, { url }) => {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20_000 });
-      return afterAction(page, `Opened ${url}`);
-    }),
-  };
-
-  const NoArgs = obj({});
-  const snapshot: ToolRegistration<typeof NoArgs> = {
-    name: "snapshot",
-    description:
-      "Read the current page: URL, interactive elements with [ref] ids for click/type, and the visible text.",
-    parameters: NoArgs,
-    replay: "safe",
-    executionMode: "sequential",
-    execute: run(async (page) => ok(await snapshotText(page))),
-  };
-
-  const ClickArgs = obj({ ref: str({ description: "Element ref from the latest snapshot, e.g. e12" }) });
-  const click: ToolRegistration<typeof ClickArgs> = {
-    name: "click",
-    description: "Click an element by its [ref]. Returns the page snapshot after the click.",
-    parameters: ClickArgs,
-    executionMode: "sequential",
-    execute: run(async (page, { ref }) => {
-      const el = await byRef(page, ref);
-      await el.click().catch(() => el.evaluate((node) => (node as unknown as { click(): void }).click()));
-      return afterAction(page, `Clicked ${ref}`);
-    }),
-  };
-
-  const TypeArgs = obj({
-    ref: str({ description: "Text box ref from the latest snapshot" }),
-    text: str({ description: "Text to enter (replaces what is in the box)" }),
-    submit: opt(bool({ description: "Press Enter after typing" })),
+    },
   });
-  const type: ToolRegistration<typeof TypeArgs> = {
-    name: "type",
-    description:
-      "Replace the contents of a text box with `text`; with submit=true also press Enter. Returns the page snapshot after.",
-    parameters: TypeArgs,
-    executionMode: "sequential",
-    execute: run(async (page, { ref, text, submit }) => {
-      const el = await byRef(page, ref);
-      await el.evaluate((node) => {
-        const input = node as unknown as { focus(): void; select?: () => void };
-        input.focus();
-        input.select?.();
-      });
-      // One CDP Input.insertText instead of a round trip per character: harness latency
-      // shouldn't eat into the model's 25 s.
-      await page.keyboard.sendCharacter(text);
-      if (submit) await page.keyboard.press("Enter");
-      return afterAction(page, `Typed ${JSON.stringify(text)} into ${ref}${submit ? " and pressed Enter" : ""}`);
-    }),
-  };
 
-  const PressArgs = obj({ key: str({ description: "Key name, e.g. Enter, Tab, Escape, ArrowDown" }) });
-  const press: ToolRegistration<typeof PressArgs> = {
-    name: "press",
-    description: "Press a keyboard key in the focused element. Returns the page snapshot after.",
-    parameters: PressArgs,
-    executionMode: "sequential",
-    execute: run(async (page, { key }) => {
-      await page.keyboard.press(key as KeyInput);
-      return afterAction(page, `Pressed ${key}`);
+  const tools: ToolRegistration[] = [
+    pageTool({
+      name: "navigate",
+      description: "Open a URL in the browser tab and return a snapshot of the page.",
+      parameters: obj({ url: str({ description: "Absolute http(s) URL" }) }),
+      replay: "safe",
+      run: async (page, { url }) => {
+        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20_000 });
+        return afterAction(page, `Opened ${url}`);
+      },
     }),
-  };
-
-  const WaitArgs = obj({ ms: int({ minimum: 100, maximum: 5_000, description: "Milliseconds to wait (100-5000)" }) });
-  const wait: ToolRegistration<typeof WaitArgs> = {
-    name: "wait",
-    description: "Wait, then return a snapshot. Use when the page is animating or loading.",
-    parameters: WaitArgs,
-    replay: "safe",
-    executionMode: "sequential",
-    execute: run(async (page, { ms }) => {
-      await scheduler.wait(ms);
-      return ok(await snapshotText(page));
+    pageTool({
+      name: "snapshot",
+      description: "Read the current page: URL, interactive elements with [ref] ids for click/type, and the visible text.",
+      parameters: obj({}),
+      replay: "safe",
+      run: async (page) => ok(await snapshotText(page)),
     }),
-  };
-
-  const screenshot: ToolRegistration<typeof NoArgs> = {
-    name: "screenshot",
-    description: "Take a screenshot of the visible part of the page.",
-    parameters: NoArgs,
-    replay: "safe",
-    executionMode: "sequential",
-    execute: run(async (page) => {
-      const data = await page.screenshot({ type: "jpeg", quality: 60, encoding: "base64" });
-      return { output: [{ type: "image", data: String(data), mimeType: "image/jpeg" }] };
+    pageTool({
+      name: "click",
+      description: "Click an element by its [ref]. Returns the page snapshot after the click.",
+      parameters: obj({ ref: str({ description: "Element ref from the latest snapshot, e.g. e12" }) }),
+      run: async (page, { ref }) => {
+        const el = await byRef(page, ref);
+        await el.click().catch(() => el.evaluate((node) => (node as unknown as PageElement).click()));
+        return afterAction(page, `Clicked ${ref}`);
+      },
     }),
-  };
-
-  const tools: ToolRegistration<any>[] = [navigate, snapshot, click, type, press, wait];
-  if (vision) tools.push(screenshot);
+    pageTool({
+      name: "type",
+      description:
+        "Replace the contents of a text box with `text`; with submit=true also press Enter. Returns the page snapshot after.",
+      parameters: obj({
+        ref: str({ description: "Text box ref from the latest snapshot" }),
+        text: str({ description: "Text to enter (replaces what is in the box)" }),
+        submit: opt(bool({ description: "Press Enter after typing" })),
+      }),
+      run: async (page, { ref, text, submit }) => {
+        const el = await byRef(page, ref);
+        await el.evaluate((node) => {
+          const input = node as unknown as PageElement;
+          input.focus();
+          input.select?.();
+        });
+        // One CDP Input.insertText instead of a round trip per character: harness latency
+        // shouldn't eat into the model's 25 s.
+        await page.keyboard.sendCharacter(text);
+        if (submit) await page.keyboard.press("Enter");
+        return afterAction(page, `Typed ${JSON.stringify(text)} into ${ref}${submit ? " and pressed Enter" : ""}`);
+      },
+    }),
+    pageTool({
+      name: "press",
+      description: "Press a keyboard key in the focused element. Returns the page snapshot after.",
+      parameters: obj({ key: str({ description: "Key name, e.g. Enter, Tab, Escape, ArrowDown" }) }),
+      run: async (page, { key }) => {
+        // Unknown key names make Puppeteer throw, which reaches the model as a tool error.
+        await page.keyboard.press(key as KeyInput);
+        return afterAction(page, `Pressed ${key}`);
+      },
+    }),
+    pageTool({
+      name: "wait",
+      description: "Wait, then return a snapshot. Use when the page is animating or loading.",
+      parameters: obj({ ms: int({ minimum: 100, maximum: 5_000, description: "Milliseconds to wait (100-5000)" }) }),
+      replay: "safe",
+      run: async (page, { ms }) => {
+        await scheduler.wait(ms);
+        return ok(await snapshotText(page));
+      },
+    }),
+  ];
+  if (vision) {
+    tools.push(
+      pageTool({
+        name: "screenshot",
+        description: "Take a screenshot of the visible part of the page.",
+        parameters: obj({}),
+        replay: "safe",
+        run: async (page) => {
+          const data = await page.screenshot({ type: "jpeg", quality: 60, encoding: "base64" });
+          return { output: [{ type: "image", data: String(data), mimeType: "image/jpeg" }] };
+        },
+      }),
+    );
+  }
   return { name: "browser", tools };
 }

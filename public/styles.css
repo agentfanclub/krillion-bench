@@ -118,7 +118,7 @@ select option { background: #0b1220; }
 .rank { color: var(--pink); font-size: 34px; text-shadow: 0 0 10px rgba(255, 93, 143, 0.35); }
 .who { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .model { font-size: 27px; overflow-wrap: anywhere; }
-.round { font-size: 15px; color: var(--dim); }
+.model-id { font-size: 15px; color: var(--dim); overflow-wrap: anywhere; }
 .score {
   color: var(--cyan);
   font-size: 44px;

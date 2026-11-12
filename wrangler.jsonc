@@ -14,8 +14,18 @@
   "vars": {
     "ACCESS_TEAM_DOMAIN": "https://adhi-thirumala.cloudflareaccess.com",
     "ACCESS_AUD": "3e841e752d8d433901699961c4d6d841d4b0d8c851608b6f6b6f18041e943874",
-    "ADMIN_EMAILS": "adhi.thirumala@gmail.com"
+    "ADMIN_EMAILS": "adhi.thirumala@gmail.com, hello@agentfanclub.com",
+    // This project's AI Gateway: Workers AI billed postpaid; Anthropic/OpenAI use BYOK keys
+    // stored on the gateway (default alias).
+    "AI_GATEWAY": "krillion-bench"
   },
+  // krillion.agentfan.club lives in the agent fan club account. It reaches this Worker as a
+  // Cloudflare for SaaS custom hostname on realartists.work (fallback origin
+  // saas.realartists.work); the agentfan.club zone only has a DNS-only CNAME
+  // krillion → saas.realartists.work (+ the _cf-custom-hostname TXT ownership record).
+  "routes": [{ "pattern": "krillion.agentfan.club/*", "zone_name": "realartists.work" }],
+  // Setting routes turns workers.dev off by default; the admin portal (Access app) lives there.
+  "workers_dev": true,
   "triggers": {
     // Krillion resets at 00:00 America/New_York. Workers cron is UTC-only, so fire at
     // both possible UTC hours (EDT = 04:05, EST = 05:05); the handler keeps the one

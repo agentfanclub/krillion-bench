@@ -25,7 +25,7 @@ function render() {
     row.append(el('span', 'rank', `#${rank}`));
 
     const who = el('div', 'who');
-    who.append(el('span', 'model', result.model), el('span', 'label round', `Krillion #${result.round}`));
+    who.append(el('span', 'model', result.model), el('span', 'model-id', result.modelId));
     row.append(who);
 
     const slots = el('div', 'slots');
