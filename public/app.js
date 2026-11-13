@@ -139,6 +139,122 @@ function renderCommon(day) {
   }));
 }
 
+const SVG = 'http://www.w3.org/2000/svg';
+function svg(tag, attrs, text) {
+  const node = document.createElementNS(SVG, tag);
+  for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+const answerKey = a => (a.outcome === 'accepted' && a.answer && a.answer.trim() ? a.answer.trim().toLowerCase() : null);
+
+// X: score. Y: per accepted answer, the share of the other models that gave it, averaged.
+function renderMap(day) {
+  const players = day.filter(r => (r.answers || []).some(answerKey));
+  $('map').hidden = players.length < 3;
+  if (players.length < 3) return;
+  const counts = [];
+  for (const r of players) r.answers.forEach((a, i) => {
+    const key = answerKey(a);
+    if (!key) return;
+    counts[i] ??= new Map();
+    counts[i].set(key, (counts[i].get(key) ?? 0) + 1);
+  });
+  const others = players.length - 1;
+  const points = players.map(r => {
+    const shares = r.answers.flatMap((a, i) => { const key = answerKey(a); return key ? [(counts[i].get(key) - 1) / others] : []; });
+    return { r, x: r.score, y: shares.reduce((s, v) => s + v, 0) / shares.length };
+  });
+  const skipped = day.length - players.length;
+  $('map-note').hidden = skipped === 0;
+  $('map-note').textContent = `${skipped} model${skipped === 1 ? '' : 's'} with no accepted answers not shown.`;
+
+  const box = $('plot');
+  const width = Math.max(280, box.clientWidth || 900);
+  const narrow = width < 600;
+  const height = narrow ? 260 : 340;
+  const m = { top: 20, right: narrow ? 16 : 28, bottom: 44, left: narrow ? 44 : 58 };
+  const xMax = Math.max(100, Math.ceil(Math.max(...points.map(p => p.x)) / 100) * 100);
+  const yMax = Math.max(0.1, Math.ceil(Math.max(...points.map(p => p.y)) * 10) / 10);
+  const sx = v => m.left + (v / xMax) * (width - m.left - m.right);
+  const sy = v => height - m.bottom - (v / yMax) * (height - m.top - m.bottom);
+
+  const root = svg('svg', { width, height, viewBox: `0 0 ${width} ${height}`, role: 'img',
+    'aria-label': `Scatter plot of ${points.length} models: score against agreement with other models.` });
+  const xStep = xMax <= 300 ? 50 : 100;
+  for (let v = 0; v <= xMax; v += xStep) {
+    root.append(svg('line', { class: 'grid', x1: sx(v), x2: sx(v), y1: m.top, y2: height - m.bottom }));
+    if (!narrow || v % (xStep * 2) === 0) root.append(svg('text', { class: 'tick', x: sx(v), y: height - m.bottom + 18, 'text-anchor': 'middle' }, v));
+  }
+  for (let v = 0; v <= yMax + 1e-9; v += 0.1) {
+    root.append(svg('line', { class: 'grid', x1: m.left, x2: width - m.right, y1: sy(v), y2: sy(v) }));
+    root.append(svg('text', { class: 'tick', x: m.left - 8, y: sy(v) + 5, 'text-anchor': 'end' }, `${Math.round(v * 100)}%`));
+  }
+  root.append(svg('line', { class: 'baseline', x1: m.left, x2: width - m.right, y1: height - m.bottom, y2: height - m.bottom }));
+  root.append(svg('text', { class: 'axis-title', x: width - m.right, y: height - 6, 'text-anchor': 'end' }, 'Score →'));
+  root.append(svg('text', { class: 'axis-title', x: 0, y: 0, transform: `translate(14 ${m.top}) rotate(-90)`, 'text-anchor': 'end' }, 'Agreement →'));
+
+  // Models with the same score and agreement share one dot.
+  const groups = new Map();
+  for (const p of points) {
+    const px = Math.round(sx(p.x)), py = Math.round(sy(p.y));
+    const g = groups.get(`${px},${py}`) ?? { px, py, list: [] };
+    g.list.push(p);
+    groups.set(`${px},${py}`, g);
+  }
+  const dots = [...groups.values()];
+  for (const g of dots) {
+    g.list.sort((a, b) => b.x - a.x || a.r.model.localeCompare(b.r.model));
+    g.node = svg('circle', { class: 'dot', cx: g.px, cy: g.py, r: g.list.length > 1 ? 6 : 4.5 });
+    root.append(g.node);
+  }
+  // Name up to three of the top scorers, skipping any label that would overlap another.
+  const placed = [];
+  for (const p of [...points].sort((a, b) => b.x - a.x || b.y - a.y)) {
+    if (placed.length === 3) break;
+    const px = sx(p.x), py = sy(p.y);
+    const w = p.r.model.length * 8 + 4;
+    const left = px + 10 + w > width - 4;
+    const x0 = left ? px - 10 - w : px + 10;
+    const box = { x0, x1: x0 + w, y0: py - 9, y1: py + 9 };
+    if (placed.some(b => b.x0 < box.x1 && box.x0 < b.x1 && b.y0 < box.y1 && box.y0 < b.y1)) continue;
+    placed.push(box);
+    root.append(svg('text', { class: 'dot-label', x: left ? px - 10 : px + 10, y: py + 5, 'text-anchor': left ? 'end' : 'start' }, p.r.model));
+  }
+
+  const tip = $('map-tip');
+  let active = null;
+  const pick = g => {
+    if (active === g) return;
+    active?.node.classList.remove('on');
+    active = g;
+    if (!g) { tip.innerHTML = '&nbsp;'; return; }
+    g.node.classList.add('on');
+    const p = g.list[0];
+    const names = g.list.length > 1 ? `${g.list.length} models: ${g.list.map(q => q.r.model).join(', ')}` : p.r.model;
+    tip.textContent = `${names} · ${p.x} pts · ${Math.round(p.y * 100)}% agreement`;
+  };
+  const near = event => {
+    const rect = root.getBoundingClientRect();
+    const x = event.clientX - rect.left, y = event.clientY - rect.top;
+    let best = null, bestD = 24 * 24;
+    for (const g of dots) { const d = (g.px - x) ** 2 + (g.py - y) ** 2; if (d < bestD) { bestD = d; best = g; } }
+    pick(best);
+  };
+  root.addEventListener('pointermove', near);
+  root.addEventListener('pointerdown', near);
+  // A tap leaves the tip up; a mouse leaving clears it.
+  root.addEventListener('pointerleave', event => { if (event.pointerType === 'mouse') pick(null); });
+  box.replaceChildren(root);
+  tip.innerHTML = '&nbsp;';
+}
+
+let resizeFrame = 0;
+window.addEventListener('resize', () => {
+  cancelAnimationFrame(resizeFrame);
+  resizeFrame = requestAnimationFrame(() => { if (results.length) renderMap(roundResults()); });
+});
+
 function render() {
   const query = $('search').value.trim().toLowerCase();
   const day = roundResults();
@@ -185,6 +301,7 @@ function renderRound() {
   const day = roundResults();
   renderChart(day);
   renderCommon(day);
+  renderMap(day);
   render();
 }
 

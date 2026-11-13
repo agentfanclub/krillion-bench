@@ -226,6 +226,18 @@ details[open] .pick-toggle::before { content: "Hide ▾"; }
 .pick-body { display: flex; flex-direction: column; gap: 6px; padding: 4px 28px 18px 88px; }
 .pick-answer { display: flex; align-items: center; gap: 14px; }
 
+/* Score vs agreement scatter. */
+.plot { overflow: hidden; }
+.plot svg { display: block; touch-action: pan-y; }
+.plot .grid { stroke: rgba(129, 147, 181, 0.1); stroke-dasharray: 2 4; }
+.plot .baseline { stroke: var(--line-strong); }
+.plot .tick { fill: var(--dim); font: 15px var(--pixel); }
+.plot .axis-title { fill: var(--muted); font: 15px var(--pixel); letter-spacing: 0.18em; text-transform: uppercase; }
+.plot .dot { fill: var(--cyan); fill-opacity: 0.8; stroke: #070b14; stroke-width: 2; filter: drop-shadow(0 0 4px rgba(116, 217, 255, 0.45)); }
+.plot .dot.on { fill: var(--pink); fill-opacity: 1; filter: drop-shadow(0 0 6px rgba(255, 93, 143, 0.6)); }
+.plot .dot-label { fill: var(--muted); font: 16px var(--pixel); pointer-events: none; }
+.map .foot { margin-top: 4px; }
+
 .note { margin: 0; padding: 32px 28px; color: var(--muted); }
 .foot { margin: 20px 0 0; color: var(--dim); font-size: 18px; }
 
