@@ -148,7 +148,7 @@ function svg(tag, attrs, text) {
 }
 const answerKey = a => (a.outcome === 'accepted' && a.answer && a.answer.trim() ? a.answer.trim().toLowerCase() : null);
 
-// X: score. Y: per accepted answer, the share of the other models that gave it, averaged.
+// X: score. Y: nicheness, per accepted answer the share of the other models that didn't give it, averaged.
 function renderMap(day) {
   const players = day.filter(r => (r.answers || []).some(answerKey));
   $('map').hidden = players.length < 3;
@@ -163,7 +163,7 @@ function renderMap(day) {
   const others = players.length - 1;
   const points = players.map(r => {
     const shares = r.answers.flatMap((a, i) => { const key = answerKey(a); return key ? [(counts[i].get(key) - 1) / others] : []; });
-    return { r, x: r.score, y: shares.reduce((s, v) => s + v, 0) / shares.length };
+    return { r, x: r.score, y: 1 - shares.reduce((s, v) => s + v, 0) / shares.length };
   });
   const skipped = day.length - players.length;
   $('map-note').hidden = skipped === 0;
@@ -173,26 +173,29 @@ function renderMap(day) {
   const width = Math.max(280, box.clientWidth || 900);
   const narrow = width < 600;
   const height = narrow ? 260 : 340;
-  const m = { top: 20, right: narrow ? 16 : 28, bottom: 44, left: narrow ? 44 : 58 };
+  const m = { top: 28, right: narrow ? 24 : 40, bottom: 64, left: narrow ? 68 : 80 };
   const xMax = Math.max(100, Math.ceil(Math.max(...points.map(p => p.x)) / 100) * 100);
-  const yMax = Math.max(0.1, Math.ceil(Math.max(...points.map(p => p.y)) * 10) / 10);
+  const yMax = Math.min(1, Math.ceil(Math.max(...points.map(p => p.y)) * 10 + 1e-9) / 10);
+  // Nicheness bunches near the top, so the axis starts just below the lowest model.
+  const yMin = Math.max(0, Math.min(yMax - 0.1, Math.floor(Math.min(...points.map(p => p.y)) * 10 - 1e-9) / 10));
   const sx = v => m.left + (v / xMax) * (width - m.left - m.right);
-  const sy = v => height - m.bottom - (v / yMax) * (height - m.top - m.bottom);
+  const sy = v => height - m.bottom - ((v - yMin) / (yMax - yMin)) * (height - m.top - m.bottom);
 
   const root = svg('svg', { width, height, viewBox: `0 0 ${width} ${height}`, role: 'img',
-    'aria-label': `Scatter plot of ${points.length} models: score against agreement with other models.` });
+    'aria-label': `Scatter plot of ${points.length} models: score against nicheness of its answers.` });
   const xStep = xMax <= 300 ? 50 : 100;
   for (let v = 0; v <= xMax; v += xStep) {
     root.append(svg('line', { class: 'grid', x1: sx(v), x2: sx(v), y1: m.top, y2: height - m.bottom }));
     if (!narrow || v % (xStep * 2) === 0) root.append(svg('text', { class: 'tick', x: sx(v), y: height - m.bottom + 18, 'text-anchor': 'middle' }, v));
   }
-  for (let v = 0; v <= yMax + 1e-9; v += 0.1) {
+  const yStep = yMax - yMin <= 0.2 ? 0.05 : 0.1;
+  for (let v = yMin; v <= yMax + 1e-9; v += yStep) {
     root.append(svg('line', { class: 'grid', x1: m.left, x2: width - m.right, y1: sy(v), y2: sy(v) }));
     root.append(svg('text', { class: 'tick', x: m.left - 8, y: sy(v) + 5, 'text-anchor': 'end' }, `${Math.round(v * 100)}%`));
   }
   root.append(svg('line', { class: 'baseline', x1: m.left, x2: width - m.right, y1: height - m.bottom, y2: height - m.bottom }));
-  root.append(svg('text', { class: 'axis-title', x: width - m.right, y: height - 6, 'text-anchor': 'end' }, 'Score →'));
-  root.append(svg('text', { class: 'axis-title', x: 0, y: 0, transform: `translate(14 ${m.top}) rotate(-90)`, 'text-anchor': 'end' }, 'Agreement →'));
+  root.append(svg('text', { class: 'axis-title', x: width - m.right, y: height - 16, 'text-anchor': 'end' }, 'Score →'));
+  root.append(svg('text', { class: 'axis-title', x: 0, y: 0, transform: `translate(${narrow ? 18 : 26} ${m.top}) rotate(-90)`, 'text-anchor': 'end' }, 'Nicheness →'));
 
   // Models with the same score and agreement share one dot.
   const groups = new Map();
@@ -211,7 +214,7 @@ function renderMap(day) {
   // Name up to three of the top scorers, skipping any label that would overlap another.
   const placed = [];
   for (const p of [...points].sort((a, b) => b.x - a.x || b.y - a.y)) {
-    if (placed.length === 3) break;
+    if (placed.length === (narrow ? 2 : 3)) break;
     const px = sx(p.x), py = sy(p.y);
     const w = p.r.model.length * 8 + 4;
     const left = px + 10 + w > width - 4;
@@ -232,7 +235,7 @@ function renderMap(day) {
     g.node.classList.add('on');
     const p = g.list[0];
     const names = g.list.length > 1 ? `${g.list.length} models: ${g.list.map(q => q.r.model).join(', ')}` : p.r.model;
-    tip.textContent = `${names} · ${p.x} pts · ${Math.round(p.y * 100)}% agreement`;
+    tip.textContent = `${names} · ${p.x} pts · ${Math.round(p.y * 100)}% niche`;
   };
   const near = event => {
     const rect = root.getBoundingClientRect();
