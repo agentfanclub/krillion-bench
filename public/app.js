@@ -148,7 +148,7 @@ function svg(tag, attrs, text) {
 }
 const answerKey = a => (a.outcome === 'accepted' && a.answer && a.answer.trim() ? a.answer.trim().toLowerCase() : null);
 
-// X: score. Y: nicheness, per accepted answer the share of the other models that didn't give it, averaged.
+// X: score. Y: uniqueness, per accepted answer the share of the other models that didn't give it, averaged.
 function renderMap(day) {
   const players = day.filter(r => (r.answers || []).some(answerKey));
   $('map').hidden = players.length < 3;
@@ -176,13 +176,13 @@ function renderMap(day) {
   const m = { top: 28, right: narrow ? 24 : 40, bottom: 64, left: narrow ? 68 : 80 };
   const xMax = Math.max(100, Math.ceil(Math.max(...points.map(p => p.x)) / 100) * 100);
   const yMax = Math.min(1, Math.ceil(Math.max(...points.map(p => p.y)) * 10 + 1e-9) / 10);
-  // Nicheness bunches near the top, so the axis starts just below the lowest model.
+  // Uniqueness bunches near the top, so the axis starts just below the lowest model.
   const yMin = Math.max(0, Math.min(yMax - 0.1, Math.floor(Math.min(...points.map(p => p.y)) * 10 - 1e-9) / 10));
   const sx = v => m.left + (v / xMax) * (width - m.left - m.right);
   const sy = v => height - m.bottom - ((v - yMin) / (yMax - yMin)) * (height - m.top - m.bottom);
 
   const root = svg('svg', { width, height, viewBox: `0 0 ${width} ${height}`, role: 'img',
-    'aria-label': `Scatter plot of ${points.length} models: score against nicheness of its answers.` });
+    'aria-label': `Scatter plot of ${points.length} models: score against uniqueness of its answers.` });
   const xStep = xMax <= 300 ? 50 : 100;
   for (let v = 0; v <= xMax; v += xStep) {
     root.append(svg('line', { class: 'grid', x1: sx(v), x2: sx(v), y1: m.top, y2: height - m.bottom }));
@@ -195,7 +195,7 @@ function renderMap(day) {
   }
   root.append(svg('line', { class: 'baseline', x1: m.left, x2: width - m.right, y1: height - m.bottom, y2: height - m.bottom }));
   root.append(svg('text', { class: 'axis-title', x: width - m.right, y: height - 16, 'text-anchor': 'end' }, 'Score →'));
-  root.append(svg('text', { class: 'axis-title', x: 0, y: 0, transform: `translate(${narrow ? 18 : 26} ${m.top}) rotate(-90)`, 'text-anchor': 'end' }, 'Nicheness →'));
+  root.append(svg('text', { class: 'axis-title', x: 0, y: 0, transform: `translate(${narrow ? 18 : 26} ${m.top}) rotate(-90)`, 'text-anchor': 'end' }, 'Uniqueness →'));
 
   // Models with the same score and agreement share one dot.
   const groups = new Map();
@@ -235,7 +235,7 @@ function renderMap(day) {
     g.node.classList.add('on');
     const p = g.list[0];
     const names = g.list.length > 1 ? `${g.list.length} models: ${g.list.map(q => q.r.model).join(', ')}` : p.r.model;
-    tip.textContent = `${names} · ${p.x} pts · ${Math.round(p.y * 100)}% niche`;
+    tip.textContent = `${names} · ${p.x} pts · ${Math.round(p.y * 100)}% unique`;
   };
   const near = event => {
     const rect = root.getBoundingClientRect();
