@@ -166,6 +166,66 @@ details[open] > .line { background: rgba(116, 217, 255, 0.04); }
   background: repeating-linear-gradient(45deg, transparent 0 3px, rgba(129, 147, 181, 0.08) 3px 4px), #05080f;
 }
 
+/* Score spread: one pixel bar per 50-point bin. */
+.chart { margin: -12px 0 32px; }
+.chart-head { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
+.chart-head .label { font-size: 16px; }
+.chart-stat { color: var(--dim); font-size: 17px; letter-spacing: 0.08em; text-transform: uppercase; }
+.bars {
+  display: grid;
+  grid-template-columns: repeat(14, minmax(0, 1fr));
+  gap: 4px;
+  height: 112px;
+  padding: 0 1px;
+  border-bottom: 1px solid var(--line-strong);
+  background: repeating-linear-gradient(180deg, transparent 0 27px, rgba(129, 147, 181, 0.07) 27px 28px);
+}
+.bar { display: flex; align-items: flex-end; height: 100%; cursor: default; }
+.bar .fill {
+  width: 100%;
+  background: var(--cyan);
+  box-shadow: 0 0 10px rgba(116, 217, 255, 0.35), inset 0 2px 0 rgba(255, 255, 255, 0.25);
+  opacity: 0.8;
+}
+.bar:not(.zero):hover .fill, .bar:focus-visible .fill { opacity: 1; box-shadow: 0 0 14px rgba(116, 217, 255, 0.6), inset 0 2px 0 rgba(255, 255, 255, 0.35); }
+.bar:focus-visible { outline-offset: 1px; }
+.axis { display: flex; justify-content: space-between; margin-top: 6px; color: var(--dim); font-size: 15px; }
+.chart-tip { margin: 6px 0 0; min-height: 1.3em; color: var(--muted); font-size: 17px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.more { display: block; margin: 20px auto 0; font-size: 19px; }
+
+/* Most common answers: each hidden behind a click. */
+.common { margin-top: 56px; }
+.common-note { margin: 16px 0 20px; font-size: 19px; }
+.common .btn { font-size: 19px; padding: 6px 16px 4px; }
+.picks { list-style: none; margin: 0; padding: 0; }
+.pick + .pick { border-top: 1px solid var(--line); }
+.pick-line {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 16px;
+  padding: 14px 28px;
+  cursor: pointer;
+  list-style: none;
+}
+.pick-line::-webkit-details-marker { display: none; }
+.pick-line:hover { background: rgba(116, 217, 255, 0.03); }
+details[open] > .pick-line { background: rgba(116, 217, 255, 0.04); }
+.pick-num { color: var(--pink); font-size: 24px; }
+.pick-prompt { color: var(--muted); font-size: 19px; overflow-wrap: anywhere; }
+.pick-toggle { color: var(--dim); font-size: 16px; letter-spacing: 0.22em; text-transform: uppercase; }
+.pick-prompt.redacted {
+  display: block;
+  height: 18px;
+  border: 1px dashed var(--line-strong);
+  background: repeating-linear-gradient(45deg, transparent 0 3px, rgba(129, 147, 181, 0.12) 3px 4px), #05080f;
+}
+.pick-toggle::before { content: "Reveal ▸"; }
+details[open] .pick-toggle::before { content: "Hide ▾"; }
+.pick-body { display: flex; flex-direction: column; gap: 6px; padding: 4px 28px 18px 88px; }
+.pick-answer { display: flex; align-items: center; gap: 14px; }
+
 .note { margin: 0; padding: 32px 28px; color: var(--muted); }
 .foot { margin: 20px 0 0; color: var(--dim); font-size: 18px; }
 
@@ -199,6 +259,12 @@ details[open] > .line { background: rgba(116, 217, 255, 0.04); }
   .compact .score { font-size: 26px; }
   .compact .slot { width: 24px; height: 24px; font-size: 13px; }
   .answers { padding: 0 16px 14px; }
+  .chart { margin: -4px 0 24px; }
+  .bars { height: 88px; gap: 2px; background: repeating-linear-gradient(180deg, transparent 0 21px, rgba(129, 147, 181, 0.07) 21px 22px); }
+  .axis span:nth-child(even) { visibility: hidden; }
+  .pick-line { grid-template-columns: 36px minmax(0, 1fr) auto; padding: 12px 16px; column-gap: 10px; }
+  .pick-toggle { font-size: 14px; letter-spacing: 0.12em; }
+  .pick-body { padding: 0 16px 14px 62px; }
 }
 
 @media (max-width: 360px) {

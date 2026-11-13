@@ -17,9 +17,16 @@
 </header>
 <p class="meta" id="round-summary">Loading…</p>
 
+<section class="chart" id="chart" aria-labelledby="chart-title" hidden>
+<div class="chart-head"><h2 class="label" id="chart-title">Score spread</h2><span class="chart-stat" id="chart-stat"></span></div>
+<div class="bars" id="bars"></div>
+<div class="axis" aria-hidden="true"><span>0</span><span>100</span><span>200</span><span>300</span><span>400</span><span>500</span><span>600</span><span>700</span></div>
+<p class="chart-tip" id="chart-tip" aria-hidden="true">&nbsp;</p>
+</section>
+
 <div class="controls">
 <label class="field field-search"><span class="label">Model</span><input id="search" type="search" placeholder="search" autocomplete="off" spellcheck="false"></label>
-<label class="field"><span class="label">Round</span><select id="round"><option value="all">All</option></select></label>
+<label class="field"><span class="label">Round</span><select id="round"></select></label>
 <label class="field"><span class="label">Sort</span><select id="sort"><option value="desc">Score high</option><option value="asc">Score low</option><option value="name">Name</option></select></label>
 </div>
 
@@ -30,7 +37,14 @@
 <p class="note" id="empty" hidden>No model matches that search.</p>
 <p class="note" id="error" hidden>scores.json didn't load. Refresh to try again.</p>
 </section>
+<button class="btn more" id="more" type="button" hidden></button>
 <p class="sr-only" aria-live="polite" id="result-count"></p>
+
+<section class="common" id="common" aria-labelledby="common-title" hidden>
+<div class="head"><h2 class="label rule" id="common-title">Most common answers</h2><button class="btn" id="show-questions" type="button">Show questions</button></div>
+<p class="meta common-note" id="common-note"></p>
+<ol class="panel picks" id="picks"></ol>
+</section>
 
 
 </main>
