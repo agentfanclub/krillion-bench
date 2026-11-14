@@ -91,6 +91,23 @@ function showQuestion(item) {
   prompt.textContent = item.dataset.prompt;
 }
 
+// Back to the redacted bar; an open answer closes with it.
+function hideQuestion(item) {
+  item.classList.remove('shown');
+  item.querySelector('details').open = false;
+  const prompt = item.querySelector('.pick-prompt');
+  prompt.textContent = '';
+  prompt.classList.add('redacted');
+  prompt.setAttribute('aria-label', 'Hidden question');
+  prompt.style.width = `${Math.min(100, 20 + item.dataset.prompt.length * 0.6)}%`;
+}
+
+function setQuestionsButton(showing) {
+  const button = $('show-questions');
+  button.textContent = showing ? 'Hide questions' : 'Show questions';
+  button.setAttribute('aria-pressed', String(showing));
+}
+
 // Per prompt, the accepted answer the most models gave (case-insensitive). Misses are skipped.
 function renderCommon(day) {
   const prompts = [];
@@ -106,18 +123,15 @@ function renderCommon(day) {
   }
   $('common').hidden = prompts.length === 0;
   $('common-note').textContent = `Spoilers for Krillion #${$('round').value}. Click a row to see the question and the answer the most models gave.`;
-  $('show-questions').hidden = false;
+  setQuestionsButton(false);
   $('picks').replaceChildren(...prompts.map((p, i) => {
     const item = el('li', 'pick');
     const details = el('details');
     const summary = el('summary', 'pick-line');
     // The question stays redacted until the row is opened.
-    const prompt = el('span', 'pick-prompt redacted');
-    prompt.style.width = `${Math.min(100, 20 + p.prompt.length * 0.6)}%`;
-    prompt.setAttribute('aria-label', 'Hidden question');
-    summary.append(el('span', 'pick-num', `Q${i + 1}`), prompt, el('span', 'pick-toggle', ''));
-    details.addEventListener('toggle', () => { if (details.open) showQuestion(item); });
     item.dataset.prompt = p.prompt;
+    summary.append(el('span', 'pick-num', `Q${i + 1}`), el('span', 'pick-prompt'), el('span', 'pick-toggle', ''));
+    details.addEventListener('toggle', () => { if (details.open) showQuestion(item); });
     details.append(summary);
     const entries = [...p.counts.values()];
     const top = Math.max(0, ...entries.map(e => e.n));
@@ -135,6 +149,7 @@ function renderCommon(day) {
     }
     details.append(body);
     item.append(details);
+    hideQuestion(item);
     return item;
   }));
 }
@@ -312,8 +327,9 @@ $('search').addEventListener('input', render);
 $('sort').addEventListener('change', render);
 $('round').addEventListener('change', renderRound);
 $('show-questions').addEventListener('click', () => {
-  for (const item of $('picks').children) showQuestion(item);
-  $('show-questions').hidden = true;
+  const showing = $('show-questions').getAttribute('aria-pressed') !== 'true';
+  for (const item of $('picks').children) (showing ? showQuestion : hideQuestion)(item);
+  setQuestionsButton(showing);
 });
 $('more').addEventListener('click', () => {
   const collapsing = showAll;
