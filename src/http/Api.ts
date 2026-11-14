@@ -2,7 +2,7 @@ import { Context, Schema } from "effect";
 import { HttpApi, HttpApiEndpoint, HttpApiGroup, HttpApiMiddleware, HttpApiSecurity } from "effect/http-api";
 import { CatalogEntry } from "../agent/gateway";
 import { AgentStatus, BatchStatus, RerunResult, StartResult } from "../Objects";
-import { BatchRow, LeaderboardEntry } from "../Database";
+import { BatchRow, LeaderboardEntry, LiveDay } from "../Database";
 import { Day, ModelsDoc } from "../domain";
 
 // Errors carry `error`: the admin page shows `body.error`.
@@ -37,6 +37,9 @@ export class AdminAuth extends HttpApiMiddleware.Service<AdminAuth, { provides: 
 /** Edge-cache the response: results change once a day, D1 bills per row read. */
 export class EdgeCache extends HttpApiMiddleware.Service<EdgeCache>()("krillion/http/EdgeCache") {}
 
+/** Edge-cache briefly: the live view changes with every submission while a day runs. */
+export class LiveEdgeCache extends HttpApiMiddleware.Service<LiveEdgeCache>()("krillion/http/LiveEdgeCache") {}
+
 /** Request decoding failures as `BadRequest`, so the admin page can show why. */
 export class RequestErrors extends HttpApiMiddleware.Service<RequestErrors>()("krillion/http/RequestErrors", {
   error: BadRequest,
@@ -52,6 +55,9 @@ export class PublicApi extends HttpApiGroup.make("public").add(
       results: Schema.Array(LeaderboardEntry),
     }),
   }).middleware(EdgeCache),
+  // Today's real day while it is played (partial results, pending prompts); null before
+  // the game is fetched. Stays until the next day, so the page can bridge the scores cache.
+  HttpApiEndpoint.get("live", "/api/live", { success: Schema.NullOr(LiveDay) }).middleware(LiveEdgeCache),
 ) {}
 
 export class AdminApi extends HttpApiGroup.make("admin")

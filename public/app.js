@@ -2,7 +2,12 @@ const $ = (id) => document.getElementById(id);
 // Krillion's own share emojis, one per tier; ⬛ is a miss (timed out or never reached).
 const labels = { '🌟': 'one in a krillion', '🏮': 'deep cut', '🦑': 'rare', '🐟': 'schooler', '🤡': 'too clever', '🫧': 'plankton', '⬛': 'miss' };
 let results = [];
+// Ranked days from /api/scores, and today's day from /api/live while it is played.
+let scored = [];
+let live = null;
+let pollTimer = 0;
 let showAll = false;
+const LIVE_POLL_MS = 30_000;
 // Rows shown before the Show All button.
 const LIMIT = 15;
 
@@ -13,9 +18,13 @@ function el(tag, className, text) {
   return node;
 }
 
-function slot(emoji) {
+// A run of a live day that hasn't finished yet.
+const inProgress = r => r.live === true && (r.status === 'queued' || r.status === 'running');
+const isPendingAnswer = a => a?.outcome === 'pending';
+
+function slot(emoji, pending) {
   const miss = emoji === '⬛';
-  const node = el('span', 'slot' + (miss ? ' empty' : ''), miss ? '' : emoji);
+  const node = el('span', 'slot' + (pending ? ' pending' : miss ? ' empty' : ''), pending || miss ? '' : emoji);
   node.setAttribute('aria-hidden', 'true');
   return node;
 }
@@ -26,15 +35,17 @@ const missText = { timed_out: 'timed out', not_reached: 'not reached' };
 function answers(result) {
   const list = el('ol', 'answers');
   (result.answers || []).forEach((a, i) => {
-    const item = el('li', 'answer');
+    const pending = isPendingAnswer(a);
+    const item = el('li', 'answer' + (pending ? ' is-pending' : ''));
     const emoji = result.emojis[i] || '⬛';
     const text = el('div', 'answer-text');
     text.append(el('span', 'prompt', a.prompt));
-    const given = a.answer ?? missText[a.outcome] ?? a.outcome;
+    const given = pending ? (result.status === 'queued' ? 'waiting to start' : 'still diving…') : a.answer ?? missText[a.outcome] ?? a.outcome;
     text.append(el('span', 'given' + (a.outcome === 'accepted' ? '' : ' missed'), given));
     const tries = a.attempts > 1 ? ` · ${a.attempts} tries` : '';
-    text.append(el('span', 'tier', `${labels[emoji] || 'unknown'}${tries}`));
-    item.append(slot(emoji), text, el('span', 'points', `+${a.score}`));
+    const soFar = a.attempts ? ` · ${a.attempts} ${a.attempts === 1 ? 'try' : 'tries'} so far` : '';
+    text.append(el('span', 'tier', pending ? `pending${soFar}` : `${labels[emoji] || 'unknown'}${tries}`));
+    item.append(slot(emoji, pending), text, el('span', 'points', pending ? '…' : `+${a.score}`));
     list.append(item);
   });
   if (!list.children.length) list.append(el('li', 'answer none', 'No answers recorded.'));
@@ -270,7 +281,7 @@ function renderMap(day) {
 let resizeFrame = 0;
 window.addEventListener('resize', () => {
   cancelAnimationFrame(resizeFrame);
-  resizeFrame = requestAnimationFrame(() => { if (results.length) renderMap(roundResults()); });
+  resizeFrame = requestAnimationFrame(() => { if (results.length) renderMap(roundResults().filter(r => !inProgress(r))); });
 });
 
 function render() {
@@ -291,20 +302,25 @@ function render() {
     // Rank within the result's own day, as the server ranked it.
     const rank = result.rank;
     // The top five get the big rows; everyone below is compact.
-    const row = el('li', 'row' + (rank === 1 ? ' first' : '') + (rank > 5 ? ' compact' : ''));
+    const going = inProgress(result);
+    const row = el('li', 'row' + (rank === 1 && !going ? ' first' : '') + (rank > 5 ? ' compact' : '') + (going ? ' going' : ''));
+    row.dataset.id = result.id;
     const details = el('details');
     const summary = el('summary', 'line');
     summary.append(el('span', 'rank', `#${rank}`));
 
     const who = el('div', 'who');
-    who.append(el('span', 'model', result.model), el('span', 'model-id', result.modelId));
+    const name = el('span', 'model', result.model);
+    if (going) name.append(el('span', 'live-tag', result.status === 'queued' ? 'queued' : `diving ${result.done}/7`));
+    who.append(name, el('span', 'model-id', result.modelId));
     summary.append(who);
 
     const slots = el('div', 'slots');
     slots.setAttribute('role', 'img');
-    slots.setAttribute('aria-label', result.emojis.map(e => labels[e] || 'unknown').join(', '));
-    for (const emoji of result.emojis) slots.append(slot(emoji));
-    summary.append(slots, el('span', 'score', String(result.score)));
+    const pending = result.emojis.map((_, i) => isPendingAnswer(result.answers?.[i]));
+    slots.setAttribute('aria-label', result.emojis.map((e, i) => (pending[i] ? 'pending' : labels[e] || 'unknown')).join(', '));
+    result.emojis.forEach((emoji, i) => slots.append(slot(emoji, pending[i])));
+    summary.append(slots, el('span', 'score' + (going ? ' partial' : ''), String(result.score)));
     details.append(summary, answers(result));
     row.append(details);
     return row;
@@ -314,13 +330,33 @@ function render() {
   $('result-count').textContent = `${visible.length} result${visible.length === 1 ? '' : 's'}`;
 }
 
+// Charts compare final scores, so they skip runs still going.
 function renderRound() {
   showAll = false;
   const day = roundResults();
-  renderChart(day);
+  const finished = day.filter(r => !inProgress(r));
+  renderChart(finished);
   renderCommon(day);
-  renderMap(day);
+  renderMap(finished);
   render();
+}
+
+// Refresh in place after a poll: keep open rows, revealed questions and Show All.
+function refreshRound() {
+  const openRows = new Set([...$('results').querySelectorAll('details[open]')].map(d => d.closest('.row').dataset.id));
+  const picks = [...$('picks').children].map(item => ({ shown: item.classList.contains('shown'), open: item.querySelector('details').open }));
+  const showing = $('show-questions').getAttribute('aria-pressed') === 'true';
+  const keepAll = showAll;
+  renderRound();
+  showAll = keepAll;
+  render();
+  for (const row of $('results').children) if (openRows.has(row.dataset.id)) row.querySelector('details').open = true;
+  [...$('picks').children].forEach((item, i) => {
+    if (!picks[i]?.shown) return;
+    showQuestion(item);
+    item.querySelector('details').open = picks[i].open;
+  });
+  setQuestionsButton(showing);
 }
 
 $('search').addEventListener('input', render);
@@ -338,26 +374,85 @@ $('more').addEventListener('click', () => {
   if (collapsing) $('results').lastElementChild?.scrollIntoView({ block: 'nearest' });
 });
 
+const valid = r => typeof r.model === 'string' && Number.isFinite(r.score) && r.score >= 0 && Number.isInteger(r.round)
+  && Number.isInteger(r.rank) && Array.isArray(r.emojis) && r.emojis.length === 7;
+
+// Today's day joins the ranked ones until /api/scores (cached longer) has it.
+function merge() {
+  const ranked = new Set(scored.map(r => r.round));
+  const today = live && !ranked.has(live.round) ? live.results.map(r => ({ ...r, live: true })) : [];
+  results = [...scored, ...today];
+}
+
+function renderLiveBanner() {
+  const going = live !== null && !live.complete && live.results.length > 0;
+  $('live-banner').hidden = !going;
+  if (!going) return;
+  const finished = live.results.filter(r => r.status !== 'queued' && r.status !== 'running').length;
+  $('live-detail').textContent = `Krillion #${live.round} · ${finished} of ${live.results.length} models finished · updates every 30 s`;
+}
+
+function fillRounds() {
+  const select = $('round');
+  const current = select.value;
+  const rounds = [...new Set(results.map(r => r.round))].sort((a, b) => b - a);
+  const liveRound = results.find(r => r.live)?.round;
+  select.replaceChildren(...rounds.map(round =>
+    Object.assign(el('option', '', `#${round}${round === liveRound ? ' (live)' : ''}`), { value: round })));
+  // Default to the latest day; one round needs no filter.
+  if (rounds.length) select.value = rounds.map(String).includes(current) ? current : String(rounds[0]);
+  select.closest('.field').hidden = rounds.length < 2;
+  const models = new Set(results.map(r => r.model)).size;
+  $('round-summary').textContent = rounds.length === 0
+    ? 'No ranked days yet · the first dive runs at midnight ET'
+    : `${rounds.length === 1 ? `Krillion #${rounds[0]}` : `${rounds.length} rounds`} · ${models} models · Ties share a place`;
+}
+
+async function fetchLive() {
+  const response = await fetch('/api/live', { cache: 'no-store' });
+  if (!response.ok) throw new Error(`/api/live returned ${response.status}`);
+  const data = await response.json();
+  if (data !== null && !data.results.every(valid)) throw new Error('Invalid live data');
+  return data;
+}
+
+// Poll while today's day is being played; stop once it is complete.
+function schedulePoll() {
+  clearTimeout(pollTimer);
+  if (!live || live.complete) return;
+  pollTimer = setTimeout(async () => {
+    try {
+      const before = $('round').value;
+      live = await fetchLive();
+      merge();
+      fillRounds();
+      renderLiveBanner();
+      if ($('round').value === before) refreshRound(); else renderRound();
+    } catch (error) {
+      console.error(error);
+    }
+    schedulePoll();
+  }, LIVE_POLL_MS);
+}
+
 async function init() {
   try {
-    const response = await fetch('/api/scores', { cache: 'no-store' });
-    if (!response.ok) throw new Error(`/api/scores returned ${response.status}`);
-    const data = await response.json();
-    results = data.results;
-    const valid = r => typeof r.model === 'string' && Number.isFinite(r.score) && r.score >= 0 && Number.isInteger(r.round)
-      && Number.isInteger(r.rank) && Array.isArray(r.emojis) && r.emojis.length === 7;
-    if (!results.every(valid)) throw new Error('Invalid score data');
-
-    const rounds = [...new Set(results.map(r => r.round))].sort((a, b) => b - a);
-    for (const round of rounds) $('round').append(Object.assign(el('option', '', `#${round}`), { value: round }));
-    // Default to the latest day; one round needs no filter.
-    if (rounds.length) $('round').value = String(rounds[0]);
-    $('round').closest('.field').hidden = rounds.length < 2;
-    const models = new Set(results.map(r => r.model)).size;
-    $('round-summary').textContent = rounds.length === 0
-      ? 'No ranked days yet · the first dive runs at midnight ET'
-      : `${rounds.length === 1 ? `Krillion #${rounds[0]}` : `${rounds.length} rounds`} · ${models} models · Ties share a place`;
+    const [scores, today] = await Promise.all([
+      fetch('/api/scores', { cache: 'no-store' }).then(response => {
+        if (!response.ok) throw new Error(`/api/scores returned ${response.status}`);
+        return response.json();
+      }),
+      // The live view is extra: the ranked days still show without it.
+      fetchLive().catch(error => { console.error(error); return null; }),
+    ]);
+    scored = scores.results;
+    if (!scored.every(valid)) throw new Error('Invalid score data');
+    live = today;
+    merge();
+    fillRounds();
+    renderLiveBanner();
     renderRound();
+    schedulePoll();
   } catch (error) {
     console.error(error);
     $('error').hidden = false;

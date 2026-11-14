@@ -166,6 +166,54 @@ details[open] > .line { background: rgba(116, 217, 255, 0.04); }
   background: repeating-linear-gradient(45deg, transparent 0 3px, rgba(129, 147, 181, 0.08) 3px 4px), #05080f;
 }
 
+/* Today's day while it is being played. */
+.live-banner {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin: 28px 0 -8px;
+  padding: 12px 20px 10px;
+  border: 1px solid rgba(255, 93, 143, 0.45);
+  background: linear-gradient(90deg, rgba(255, 93, 143, 0.12), rgba(255, 93, 143, 0.02) 70%), var(--panel);
+  box-shadow: 0 0 18px rgba(255, 93, 143, 0.12);
+}
+.live-text { display: flex; flex-wrap: wrap; align-items: baseline; column-gap: 16px; min-width: 0; }
+.live-text strong { color: var(--pink); font-weight: 400; font-size: 22px; letter-spacing: 0.14em; text-transform: uppercase; }
+.live-text span { color: var(--muted); font-size: 18px; }
+.live-dot, .live-tag::before {
+  flex: none;
+  width: 10px;
+  height: 10px;
+  background: var(--pink);
+  box-shadow: 0 0 8px rgba(255, 93, 143, 0.8);
+  animation: blink 1.2s steps(2, jump-none) infinite;
+}
+.live-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 12px;
+  padding: 1px 8px 0;
+  border: 1px solid rgba(255, 93, 143, 0.4);
+  color: var(--pink);
+  font-size: 14px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  vertical-align: middle;
+}
+.live-tag::before { content: ""; width: 6px; height: 6px; box-shadow: none; }
+.slot.pending {
+  border: 1px dashed rgba(116, 217, 255, 0.45);
+  background: #05080f;
+  animation: pulse 1.6s ease-in-out infinite;
+}
+.slot.pending::after { content: ""; width: 4px; height: 4px; background: rgba(116, 217, 255, 0.6); }
+.score.partial { color: var(--muted); text-shadow: none; }
+.answer.is-pending .points { color: var(--dim); }
+@keyframes blink { 50% { opacity: 0.25; } }
+@keyframes pulse { 50% { border-color: rgba(116, 217, 255, 0.12); background: rgba(116, 217, 255, 0.06); } }
+@media (prefers-reduced-motion: reduce) { .live-dot, .live-tag::before, .slot.pending { animation: none; } }
+
 /* Score spread: one pixel bar per 50-point bin. */
 .chart { margin: -12px 0 32px; }
 .chart-head { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin-bottom: 12px; }

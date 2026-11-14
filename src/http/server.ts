@@ -10,9 +10,20 @@ import { Database } from "../Database";
 import { eastern, easternToday } from "../domain";
 import { Objects } from "../Objects";
 import { Roster } from "../Roster";
-import { AdminAuth, AdminEmail, Api, BadRequest, Conflict, EdgeCache, Forbidden, RequestErrors } from "./Api";
+import {
+  AdminAuth,
+  AdminEmail,
+  Api,
+  BadRequest,
+  Conflict,
+  EdgeCache,
+  Forbidden,
+  LiveEdgeCache,
+  RequestErrors,
+} from "./Api";
 
 const SCORES_TTL_S = 300;
+const LIVE_TTL_S = 30;
 const DEFAULT_DAYS = 30;
 
 /** The admin's email for a Cloudflare Access token, or `Forbidden`. */
@@ -60,31 +71,37 @@ const AdminAuthLive = Layer.effect(
   }),
 );
 
-const EdgeCacheLive = Layer.succeed(EdgeCache)((httpEffect) =>
+const edgeCached =
+  (ttlSeconds: number) =>
+  <E, R>(httpEffect: Effect.Effect<HttpServerResponse.HttpServerResponse, E, R>) =>
   Effect.gen(function* () {
     const request = yield* Effect.orDie(HttpServerRequest.toWeb(yield* HttpServerRequest.HttpServerRequest));
     const hit = yield* Effect.promise(() => caches.default.match(request));
     if (hit !== undefined) return HttpServerResponse.fromWeb(hit);
     const response = HttpServerResponse.toWeb(
-      HttpServerResponse.setHeader(yield* httpEffect, "cache-control", `public, max-age=${SCORES_TTL_S}`),
+      HttpServerResponse.setHeader(yield* httpEffect, "cache-control", `public, max-age=${ttlSeconds}`),
     );
     if (response.ok) waitUntil(caches.default.put(request, response.clone()));
     return HttpServerResponse.fromWeb(response);
-  }),
-);
+  });
+
+const EdgeCacheLive = Layer.succeed(EdgeCache)(edgeCached(SCORES_TTL_S));
+const LiveEdgeCacheLive = Layer.succeed(LiveEdgeCache)(edgeCached(LIVE_TTL_S));
 
 const PublicHandlers = HttpApiBuilder.group(
   Api,
   "public",
   Effect.fn(function* (handlers) {
     const db = yield* Database;
-    return handlers.handle("scores", ({ query }) =>
-      Effect.gen(function* () {
-        const since = eastern(DateTime.subtract(yield* DateTime.now, { days: query.days ?? DEFAULT_DAYS })).day;
-        const results = yield* Effect.orDie(db.leaderboard(since));
-        return { benchmark: "Krillion" as const, since, results };
-      }),
-    );
+    return handlers
+      .handle("scores", ({ query }) =>
+        Effect.gen(function* () {
+          const since = eastern(DateTime.subtract(yield* DateTime.now, { days: query.days ?? DEFAULT_DAYS })).day;
+          const results = yield* Effect.orDie(db.leaderboard(since));
+          return { benchmark: "Krillion" as const, since, results };
+        }),
+      )
+      .handle("live", () => Effect.orDie(Effect.flatMap(easternToday, db.liveDay)));
   }),
 );
 
@@ -174,7 +191,7 @@ const RequestErrorsLive = HttpApiMiddleware.layerSchemaErrorTransform(RequestErr
 
 const ApiLive = HttpApiBuilder.layer(Api).pipe(
   Layer.provide([PublicHandlers, AdminHandlers]),
-  Layer.provide([AdminAuthLive, EdgeCacheLive, RequestErrorsLive]),
+  Layer.provide([AdminAuthLive, EdgeCacheLive, LiveEdgeCacheLive, RequestErrorsLive]),
 );
 
 /** Unmatched routes and client disconnects are answered (404, 499), not failures worth an error log. */
