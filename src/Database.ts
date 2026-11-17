@@ -59,8 +59,36 @@ export const LeaderboardEntry = Schema.Struct({
   rank: Schema.Number,
   /** One per prompt in game order: the tier emoji, or ⬛ for a miss. */
   emojis: Schema.Array(Schema.String),
+  /** One per prompt in game order, matching `emojis`. */
+  answers: Schema.Array(
+    Schema.Struct({
+      prompt: Schema.String,
+      outcome: Schema.String,
+      answer: Schema.NullOr(Schema.String),
+      score: Schema.Number,
+      attempts: Schema.Number,
+    }),
+  ),
 });
 export type LeaderboardEntry = typeof LeaderboardEntry.Type;
+
+/** A model's run on a day that is still being played: finished prompts so far, the rest pending. */
+export const LiveEntry = Schema.Struct({
+  ...LeaderboardEntry.fields,
+  status: RunStatus,
+  /** Prompts with a result so far (accepted or missed), out of 7. */
+  done: Schema.Number,
+});
+export type LiveEntry = typeof LiveEntry.Type;
+
+export const LiveDay = Schema.Struct({
+  day: Schema.String,
+  round: Schema.Number,
+  /** True once every run has finished and the day is ranked. */
+  complete: Schema.Boolean,
+  results: Schema.Array(LiveEntry),
+});
+export type LiveDay = typeof LiveDay.Type;
 
 const ScoreRow = Schema.Struct({
   day: Schema.String,
@@ -71,7 +99,28 @@ const ScoreRow = Schema.Struct({
   dayNumber: Schema.Number,
   label: Schema.String,
 });
-const ResultTierRow = Schema.Struct({ runId: Schema.String, tier: Schema.NullOr(Schema.String), outcome: Schema.String });
+const ResultRow = Schema.Struct({
+  runId: Schema.String,
+  tier: Schema.NullOr(Schema.String),
+  outcome: Schema.String,
+  text: Schema.String,
+  answer: Schema.NullOr(Schema.String),
+  score: Schema.Number,
+  attempts: Schema.Number,
+});
+
+const LiveGameRow = Schema.Struct({ dayNumber: Schema.Number, status: Schema.String });
+const PromptRow = Schema.Struct({ promptId: Schema.String, text: Schema.String });
+const RunResultRow = Schema.Struct({
+  runId: Schema.String,
+  promptId: Schema.String,
+  outcome: Schema.String,
+  tier: Schema.NullOr(Schema.String),
+  answer: Schema.NullOr(Schema.String),
+  score: Schema.Number,
+  attempts: Schema.Number,
+});
+const RunSubmissionRow = Schema.Struct({ runId: Schema.String, ...SubmissionResult.fields });
 
 /** Krillion's own share emojis (from the game bundle's TIERS / MISS_EMOJI). */
 const TIER_EMOJI: Readonly<Record<string, string>> = {
@@ -102,6 +151,26 @@ const countedRuns = (runs: ReadonlyArray<RunRow>): Array<RunRow> => {
   }
   return [...counted.values()];
 };
+
+/**
+ * The run shown per model while a day is live: the latest attempt still going, else the
+ * one that counts (see `countedRuns`).
+ */
+const liveRuns = (runs: ReadonlyArray<RunRow>): Array<RunRow> => {
+  const counted = new Map(countedRuns(runs).map((r) => [r.modelId, r]));
+  for (const r of runs) {
+    if (r.trial || isTerminal(r.status)) continue;
+    const prev = counted.get(r.modelId);
+    if (prev === undefined || isTerminal(prev.status) || r.attempt > prev.attempt) counted.set(r.modelId, r);
+  }
+  return [...counted.values()];
+};
+
+const tierEmoji = (outcome: string, tier: string | null) =>
+  outcome === "accepted" && tier !== null ? (TIER_EMOJI[tier] ?? MISS_EMOJI) : MISS_EMOJI;
+
+/** Pending prompts have no emoji yet. */
+const PENDING_EMOJI = "";
 
 const byScoreDesc = Order.flip(Order.mapInput(Order.Number, (r: RunRow) => r.totalScore ?? 0));
 
@@ -244,6 +313,83 @@ export class Database extends Context.Service<Database>()("krillion/Database", {
         sql`SELECT batch, day, trial, models, created_by, created_at FROM batches
           ORDER BY created_at DESC LIMIT ${limit}`.pipe(rows(BatchRow), Effect.withSpan("Database.recentBatches")),
 
+      /**
+       * A real day as it is being played, or null before its game is fetched. Finished runs
+       * come from `results`; runs still going are scored from the submissions captured so
+       * far: a prompt is accepted, missed (a later prompt has submissions), or pending.
+       */
+      liveDay: Effect.fn("Database.liveDay")(function* (day: Day) {
+        const games = yield* sql`SELECT day_number, status FROM games WHERE day = ${day}`.pipe(rows(LiveGameRow));
+        const game = games[0];
+        if (game === undefined) return null;
+        const prompts = yield* sql`SELECT prompt_id, text FROM prompts WHERE day = ${day} ORDER BY position`.pipe(
+          rows(PromptRow),
+        );
+        const runs = liveRuns(yield* runsOfBatch(day));
+        // Both join through runs' (batch, …) index into the per-run primary keys.
+        const results = yield* sql`SELECT r.run_id, r.prompt_id, r.outcome, r.tier, r.answer, r.score, r.attempts
+          FROM runs x JOIN results r ON r.run_id = x.run_id WHERE x.batch = ${day}`.pipe(rows(RunResultRow));
+        const subs = yield* sql`SELECT s.run_id, s.prompt_id, s.kind, s.canonical, s.tier, s.score, s.clock_ms
+          FROM runs x JOIN submissions s ON s.run_id = x.run_id
+          WHERE x.batch = ${day} AND x.status IN ('queued', 'running')
+          ORDER BY s.run_id, s.seq`.pipe(rows(RunSubmissionRow));
+        const resultsByRun = Arr.groupBy(results, (r) => r.runId);
+        const subsByRun = Arr.groupBy(subs, (s) => s.runId);
+
+        const entries = runs.map((run) => {
+          const finished = resultsByRun[run.runId];
+          const mine = subsByRun[run.runId] ?? [];
+          const answers = prompts.map((p, i) => {
+            const result = finished?.find((r) => r.promptId === p.promptId);
+            if (result !== undefined) {
+              return { ...result, prompt: p.text, emoji: tierEmoji(result.outcome, result.tier) };
+            }
+            const tries = mine.filter((s) => s.promptId === p.promptId);
+            const accepted = tries.find((s) => s.kind === "accepted");
+            if (accepted !== undefined) {
+              const tier = accepted.tier;
+              return {
+                prompt: p.text,
+                outcome: "accepted",
+                answer: accepted.canonical,
+                score: accepted.score ?? 0,
+                attempts: tries.length,
+                emoji: tierEmoji("accepted", tier),
+              };
+            }
+            const movedOn = prompts.slice(i + 1).some((q) => mine.some((s) => s.promptId === q.promptId));
+            // A finished run without result rows (its summary never got written) missed the rest.
+            const outcome = movedOn || isTerminal(run.status) ? (tries.length > 0 ? "timed_out" : "not_reached") : "pending";
+            return {
+              prompt: p.text,
+              outcome,
+              answer: null,
+              score: 0,
+              attempts: tries.length,
+              emoji: outcome === "pending" ? PENDING_EMOJI : MISS_EMOJI,
+            };
+          });
+          return {
+            id: run.runId,
+            model: run.modelConfig.label,
+            modelId: run.modelId,
+            day,
+            round: game.dayNumber,
+            score: answers.reduce((sum, a) => sum + a.score, 0),
+            status: run.status,
+            done: answers.filter((a) => a.outcome !== "pending").length,
+            emojis: answers.map((a) => a.emoji),
+            answers: answers.map(({ prompt, outcome, answer, score, attempts }) => ({ prompt, outcome, answer, score, attempts })),
+          };
+        });
+        // Ties share a place, as in `finalizeDay`.
+        const ranked = entries.map((e): LiveEntry => ({
+          ...e,
+          rank: 1 + entries.filter((o) => o.score > e.score).length,
+        }));
+        return { day, round: game.dayNumber, complete: game.status === "complete", results: ranked } satisfies LiveDay;
+      }),
+
       /** Ranked results for real days since `since`: `daily_scores` by PK range, then each counted run's `results`. */
       leaderboard: Effect.fn("Database.leaderboard")(function* (since: Day) {
         const scores = yield* sql`SELECT ds.day, ds.model_id, ds.run_id, ds.total_score, ds.rank, g.day_number, m.label
@@ -253,15 +399,16 @@ export class Database extends Context.Service<Database>()("krillion/Database", {
           WHERE ds.day >= ${since}`.pipe(rows(ScoreRow));
         if (scores.length === 0) return [];
         // Join through daily_scores rather than an IN list: D1 caps bound parameters at 100.
-        const results = yield* sql`SELECT r.run_id, r.tier, r.outcome
+        const results = yield* sql`SELECT r.run_id, r.tier, r.outcome, p.text, r.answer, r.score, r.attempts
           FROM daily_scores ds
           JOIN results r ON r.run_id = ds.run_id
           JOIN prompts p ON p.day = r.day AND p.prompt_id = r.prompt_id
           WHERE ds.day >= ${since}
-          ORDER BY r.run_id, p.position`.pipe(rows(ResultTierRow));
-        const emojis = Arr.groupBy(results, (r) => r.runId);
-        return scores.map(
-          (r): LeaderboardEntry => ({
+          ORDER BY r.run_id, p.position`.pipe(rows(ResultRow));
+        const byRun = Arr.groupBy(results, (r) => r.runId);
+        return scores.map((r): LeaderboardEntry => {
+          const prompts = byRun[r.runId] ?? [];
+          return {
             id: r.runId,
             model: r.label,
             modelId: r.modelId,
@@ -269,11 +416,16 @@ export class Database extends Context.Service<Database>()("krillion/Database", {
             round: r.dayNumber,
             score: r.totalScore,
             rank: r.rank,
-            emojis: (emojis[r.runId] ?? []).map((x) =>
-              x.outcome === "accepted" && x.tier !== null ? (TIER_EMOJI[x.tier] ?? MISS_EMOJI) : MISS_EMOJI,
-            ),
-          }),
-        );
+            emojis: prompts.map((x) => tierEmoji(x.outcome, x.tier)),
+            answers: prompts.map((x) => ({
+              prompt: x.text,
+              outcome: x.outcome,
+              answer: x.answer,
+              score: x.score,
+              attempts: x.attempts,
+            })),
+          };
+        });
       }),
     };
   }),
