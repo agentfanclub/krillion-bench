@@ -7,9 +7,9 @@ import { PiHarness, type PiOperationResult } from "agents/harness/pi";
 import { Lifecycle, type LifecycleJobContext, type LifecycleJobOutcome } from "agents/lifecycle";
 import { type AI, createAI } from "agents/models/pi-ai";
 import { DurableObject } from "cloudflare:workers";
-import { Cause, Clock, Context, Effect, FiberSet, Match, Option, Schema, Scope } from "effect";
+import { Cause, Clock, Context, type Data, Effect, FiberSet, Match, Option, Schema, Scope } from "effect";
 import { durableObjectRunner } from "../App";
-import { JobQueue, type Stored, stored } from "../Cloudflare";
+import { JobQueue, stored } from "../Cloudflare";
 import { Database, type SubmissionResult } from "../Database";
 import { type PromptResult, RunInput, type RunSummary, type TerminalStatus } from "../domain";
 import { clip, logRecovered } from "../Logging";
@@ -38,28 +38,15 @@ const Job = Schema.Union([
 type Job = typeof Job.Type;
 
 /** The agent's durable state (same keys as every earlier version). */
-interface RunState {
-  readonly input: Stored<Option.Option<RunInput>, RunInput>;
-  readonly phase: Stored<Option.Option<DivePhase>, DivePhase>;
-  readonly startedAt: Stored<Option.Option<number>, number>;
-  readonly steps: Stored<number>;
-  readonly nudges: Stored<number>;
-  /** The operation whose outcome finalize waits for: the prompt, or the latest nudge. */
-  readonly lastOperation: Stored<Option.Option<string>, string>;
-  /** The last provider error message the gateway wrapper saw (its own words, not Pi's). */
-  readonly providerError: Stored<Option.Option<string>, string>;
-  /** Set once any provider call of this run was rate limited. */
-  readonly rateLimited: Stored<boolean>;
-}
-
-const runState = (kv: SyncKvStorage): RunState => ({
+const runState = (kv: SyncKvStorage) => ({
   input: stored(kv, "run:input", RunInput),
   phase: stored(kv, "run:phase", DivePhase),
   startedAt: stored(kv, "run:startedAt", Schema.Number),
   steps: stored(kv, "run:steps", Schema.Number, 0),
   nudges: stored(kv, "run:nudges", Schema.Number, 0),
-  lastOperation: stored(kv, "run:lastOperation", Schema.String),
+  /** The last provider error message the gateway wrapper saw (its own words, not Pi's). */
   providerError: stored(kv, "run:lastProviderError", Schema.String),
+  /** Set once any provider call of this run was rate limited. */
   rateLimited: stored(kv, "run:rateLimited", Schema.Boolean, false),
 });
 
@@ -67,7 +54,7 @@ const runState = (kv: SyncKvStorage): RunState => ({
 class Dive extends Context.Service<
   Dive,
   {
-    readonly state: RunState;
+    readonly state: ReturnType<typeof runState>;
     readonly harness: PiHarness;
     readonly browser: Browser;
     readonly page: RunPage;
@@ -79,6 +66,28 @@ class Dive extends Context.Service<
     readonly installTools: () => void;
   }
 >()("krillion/Dive") {}
+
+/** Decoded from the stored keys: New → Accepted → Running → Finalized; a failed begin finalizes from Accepted. */
+type DiveState = Data.TaggedEnum<{
+  New: {};
+  Accepted: { readonly input: RunInput };
+  Running: { readonly input: RunInput; readonly startedAt: number };
+  Finalized: { readonly input: RunInput };
+}>;
+
+const diveState = Dive.useSync(({ state }): DiveState => {
+  const input = state.input.getUnsafe();
+  if (Option.isNone(input)) return { _tag: "New" };
+  const phase = state.phase.getUnsafe();
+  if (Option.contains(phase, "finalized")) return { _tag: "Finalized", input: input.value };
+  const startedAt = state.startedAt.getUnsafe();
+  return Option.contains(phase, "running") && Option.isSome(startedAt)
+    ? { _tag: "Running", input: input.value, startedAt: startedAt.value }
+    : { _tag: "Accepted", input: input.value };
+});
+
+/** Pi operation id of the prompt (nudge 0) or of a nudge. */
+const operationOf = (runId: string, nudge: number) => (nudge === 0 ? runId : `${runId}:nudge-${nudge}`);
 
 /** Run `self`; on failure log `message` with the cause and use `fallback`. */
 const orWarn =
@@ -200,13 +209,13 @@ const runError = (
 const finalize = Effect.fn("Dive.finalize")(function* (reason: FinalizeReason, error?: unknown) {
   const dive = yield* Dive;
   const { state, harness } = dive;
-  const stored = yield* state.input.get;
-  if (Option.isNone(stored) || Option.contains(yield* state.phase.get, "finalized")) return;
-  const input = stored.value;
+  const current = yield* diveState;
+  if (current._tag === "New" || current._tag === "Finalized") return;
+  const { input } = current;
   const db = yield* Database;
 
   if (reason !== "ended") yield* Effect.tryPromise(() => harness.abort()).pipe(orWarn("harness abort failed", false));
-  const lastOp = Option.getOrElse(yield* state.lastOperation.get, () => input.runId);
+  const lastOp = operationOf(input.runId, yield* state.nudges.get);
   const outcome = yield* Effect.tryPromise((signal) => harness.wait(lastOp, { signal })).pipe(
     Effect.timeout("30 seconds"),
     orWarn("harness wait failed; outcome unknown", undefined),
@@ -292,9 +301,9 @@ const finalize = Effect.fn("Dive.finalize")(function* (reason: FinalizeReason, e
 const begin = Effect.gen(function* () {
   const dive = yield* Dive;
   const { state, harness } = dive;
-  const stored = yield* state.input.get;
-  if (Option.isNone(stored) || Option.isSome(yield* state.phase.get)) return;
-  const input = stored.value;
+  const current = yield* diveState;
+  if (current._tag !== "Accepted") return;
+  const { input } = current;
   const db = yield* Database;
   const started = yield* Effect.gen(function* () {
     yield* Effect.tryPromise(() => dive.page.page()); // open the browser before the model's clock starts
@@ -326,11 +335,11 @@ const begin = Effect.gen(function* () {
 /** Every few seconds: end the run when the dive is done or over time; nudge a model that stopped early. */
 const watch = Effect.gen(function* () {
   const { state, harness } = yield* Dive;
-  const stored = yield* state.input.get;
-  if (Option.isNone(stored) || !Option.contains(yield* state.phase.get, "running")) return undefined;
-  const input = stored.value;
+  const current = yield* diveState;
+  if (current._tag !== "Running") return undefined;
+  const { input, startedAt } = current;
   const now = yield* Clock.currentTimeMillis;
-  if (now - Option.getOrElse(yield* state.startedAt.get, () => now) > RUN_WALL_MS) {
+  if (now - startedAt > RUN_WALL_MS) {
     yield* finalize("deadline");
     return undefined;
   }
@@ -349,9 +358,8 @@ const watch = Effect.gen(function* () {
   // for every model). Some models end a turn on a stray text message mid-game.
   const nudges = yield* state.nudges.get;
   if (nudges < MAX_NUDGES) {
-    const operationId = `${input.runId}:nudge-${nudges + 1}`;
+    const operationId = operationOf(input.runId, nudges + 1);
     yield* state.nudges.set(nudges + 1);
-    yield* state.lastOperation.set(operationId);
     yield* Effect.orDie(Effect.tryPromise(() => harness.submit(NUDGE, { operationId })));
     return { rescheduleAt: now + WATCH_EVERY_MS };
   }
@@ -370,7 +378,7 @@ const runJob = Match.type<Job>().pipe(
 /** Idempotent: a second call for the same object is a no-op. Returns before the model runs. */
 const start = Effect.fn("Dive.start")(function* (input: RunInput) {
   const dive = yield* Dive;
-  if (Option.isSome(yield* dive.state.input.get)) return { accepted: false };
+  if ((yield* diveState)._tag !== "New") return { accepted: false };
   yield* dive.state.input.set(input);
   dive.installTools(); // the vision flag is known now
   yield* dive.jobs.push({ fn: "begin" });
@@ -379,9 +387,9 @@ const start = Effect.fn("Dive.start")(function* (input: RunInput) {
 
 /** Coordinator deadline: stop the model and record what it has. */
 const abort = Effect.gen(function* () {
-  const { state, jobs } = yield* Dive;
-  if (Option.isNone(yield* state.input.get) || Option.contains(yield* state.phase.get, "finalized")) return;
-  yield* jobs.push({ fn: "finalize", payload: "deadline" });
+  const { _tag } = yield* diveState;
+  if (_tag === "New" || _tag === "Finalized") return;
+  yield* (yield* Dive).jobs.push({ fn: "finalize", payload: "deadline" });
 }).pipe(Effect.withSpan("Dive.abort"));
 
 const status = Effect.gen(function* () {

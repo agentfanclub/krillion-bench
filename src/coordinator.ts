@@ -1,9 +1,9 @@
 import { Lifecycle, type LifecycleJobContext, type LifecycleJobOutcome } from "agents/lifecycle";
 import { DurableObject } from "cloudflare:workers";
-import { Clock, Context, Effect, Match, Option, Result, Schema } from "effect";
+import { Clock, Context, type Data, Effect, Match, Option, Result, Schema } from "effect";
 import { PROMPT_VERSION } from "./agent/prompt";
 import { durableObjectRunner } from "./App";
-import { JobQueue, type Stored, stored } from "./Cloudflare";
+import { JobQueue, stored } from "./Cloudflare";
 import { Database } from "./Database";
 import { BatchConfig, type BatchRequest, isTerminal, type ModelEntry, TodayGame } from "./domain";
 import { Krillion } from "./Krillion";
@@ -28,19 +28,37 @@ const Job = Schema.Union([
 ]);
 type Job = typeof Job.Type;
 
+/** The batch's durable state (same keys as every earlier version). */
+const batchKeys = (kv: SyncKvStorage) => ({
+  config: stored(kv, "batch:config", BatchConfig),
+  game: stored(kv, "batch:game", TodayGame),
+  phase: stored(kv, "batch:phase", BatchPhase),
+});
+
 /** This coordinator's batch: its name, durable state, and job queue. */
 class Batch extends Context.Service<
   Batch,
-  {
-    readonly name: string;
-    readonly config: Stored<Option.Option<BatchConfig>, BatchConfig>;
-    readonly game: Stored<Option.Option<TodayGame>, TodayGame>;
-    readonly phase: Stored<Option.Option<BatchPhase>, BatchPhase>;
-    readonly jobs: JobQueue<Job>;
-  }
+  ReturnType<typeof batchKeys> & { readonly name: string; readonly jobs: JobQueue<Job> }
 >()("krillion/Batch") {}
 
-const isDispatched = Batch.use((batch) => Effect.map(batch.phase.get, Option.contains<BatchPhase>("dispatched")));
+/** Decoded from the stored keys: New → Pending → Dispatched → Closed (has a game) | Abandoned (failed without one). */
+type BatchState = Data.TaggedEnum<{
+  New: {};
+  Pending: { readonly config: BatchConfig };
+  Dispatched: { readonly config: BatchConfig; readonly game: TodayGame };
+  Closed: { readonly config: BatchConfig; readonly game: TodayGame };
+  Abandoned: { readonly config: BatchConfig };
+}>;
+
+const batchState = Batch.useSync(({ config, game, phase }): BatchState => {
+  const c = config.getUnsafe();
+  if (Option.isNone(c)) return { _tag: "New" };
+  const p = phase.getUnsafe();
+  if (Option.isNone(p)) return { _tag: "Pending", config: c.value };
+  const g = game.getUnsafe();
+  if (Option.isNone(g)) return { _tag: "Abandoned", config: c.value };
+  return { _tag: p.value === "dispatched" ? "Dispatched" : "Closed", config: c.value, game: g.value };
+});
 
 /** Insert the run row (unless `runId` names an existing one) and start its agent. Both steps are idempotent. */
 const launch = Effect.fn("Batch.launch")(function* (run: {
@@ -77,41 +95,36 @@ const staggered = <E, R>(models: ReadonlyArray<ModelEntry>, f: (model: ModelEntr
     discard: true,
   });
 
-const finalize = Effect.gen(function* () {
+const finalize = Effect.fn("Batch.finalize")(function* ({ config, game }: Data.TaggedEnum.Value<BatchState, "Dispatched">) {
   const batch = yield* Batch;
-  const config = yield* batch.config.get;
-  if (Option.isNone(config) || Option.contains(yield* batch.phase.get, "finalized")) return;
-  const game = yield* batch.game.get;
-  if (!config.value.trial && Option.isSome(game)) yield* (yield* Database).finalizeDay(game.value.date);
+  if (!config.trial) yield* (yield* Database).finalizeDay(game.date);
   yield* batch.phase.set("finalized");
   yield* batch.jobs.cancel("deadline");
   yield* batch.jobs.cancel("force-close");
-}).pipe(Effect.withSpan("Batch.finalize"));
+});
 
 /** Retry first-attempt infra failures once; finalize when every run is terminal. */
 const reconcile = Effect.gen(function* () {
-  if (!(yield* isDispatched)) return;
-  const batch = yield* Batch;
-  const runs = yield* (yield* Database).runsOfBatch(batch.name);
+  const state = yield* batchState;
+  if (state._tag !== "Dispatched") return;
+  const runs = yield* (yield* Database).runsOfBatch((yield* Batch).name);
   const retry = runs.find(
     (r) => r.status === "infra_error" && r.attempt === 1 && !runs.some((o) => o.modelId === r.modelId && o.attempt === 2),
   );
-  const game = yield* batch.game.get;
-  const config = yield* batch.config.get;
-  if (retry !== undefined && Option.isSome(game) && Option.isSome(config)) {
+  if (retry !== undefined) {
     yield* Effect.logWarning("retrying run after infra error").pipe(
       Effect.annotateLogs({ runId: retry.runId, modelId: retry.modelId }),
     );
-    yield* launch({ game: game.value, config: config.value, model: retry.modelConfig, attempt: 2 });
+    yield* launch({ ...state, model: retry.modelConfig, attempt: 2 });
     return; // the retry's own report reconciles again
   }
-  if (runs.every((r) => isTerminal(r.status))) yield* finalize;
+  if (runs.every((r) => isTerminal(r.status))) yield* finalize(state);
 }).pipe(Effect.withSpan("Batch.reconcile"));
 
 /** Idempotent: the cron's two daily firings, retries, and manual calls all land here. */
 const start = Effect.fn("Batch.start")(function* (request: BatchRequest) {
   const batch = yield* Batch;
-  if (Option.isSome(yield* batch.config.get)) return { batch: batch.name, accepted: false };
+  if ((yield* batchState)._tag !== "New") return { batch: batch.name, accepted: false };
   const config: BatchConfig = { ...request, createdAt: yield* Clock.currentTimeMillis };
   yield* batch.config.set(config);
   yield* (yield* Database).registerBatch(batch.name, config);
@@ -134,13 +147,12 @@ const status = Effect.gen(function* () {
  * roster entry, as a new attempt each. The day reopens if it was finalized (or failed)
  * and gets a fresh deadline, so the new runs aren't stopped by the old one; it is
  * re-ranked when they finish, and the counting rule picks the new attempt unless it
- * is an infra error. Null when this batch is not a dispatched real day.
+ * is an infra error. Null unless this batch is a real day that has its game.
  */
 const rerun = Effect.fn("Batch.rerun")(function* (modelIds: ReadonlyArray<string>) {
   const batch = yield* Batch;
-  const config = yield* batch.config.get;
-  const game = yield* batch.game.get;
-  if (Option.isNone(config) || config.value.trial || Option.isNone(game)) return null;
+  const state = yield* batchState;
+  if ((state._tag !== "Dispatched" && state._tag !== "Closed") || state.config.trial) return null;
 
   const models = (yield* (yield* Roster).enabled).filter((m) => modelIds.includes(m.id));
   const skipped = modelIds.filter((id) => !models.some((m) => m.id === id));
@@ -155,7 +167,7 @@ const rerun = Effect.fn("Batch.rerun")(function* (modelIds: ReadonlyArray<string
     const attempt = Math.max(0, ...runs.filter((r) => r.modelId === model.id).map((r) => r.attempt)) + 1;
     return Effect.logInfo("rerunning model for day").pipe(
       Effect.annotateLogs({ modelId: model.id, attempt }),
-      Effect.andThen(launch({ game: game.value, config: config.value, model, attempt })),
+      Effect.andThen(launch({ ...state, model, attempt })),
     );
   });
   if (skipped.length > 0) {
@@ -167,9 +179,9 @@ const rerun = Effect.fn("Batch.rerun")(function* (modelIds: ReadonlyArray<string
 /** Fetch the game (waiting for the site's rollover), launch every rostered model, start the deadline. */
 const dispatch = Effect.gen(function* () {
   const batch = yield* Batch;
-  const stored = yield* batch.config.get;
-  if (Option.isNone(stored) || Option.isSome(yield* batch.phase.get)) return undefined;
-  const config = stored.value;
+  const state = yield* batchState;
+  if (state._tag !== "Pending") return undefined;
+  const { config } = state;
   const krillion = yield* Krillion;
   const db = yield* Database;
 
@@ -213,7 +225,7 @@ const dispatch = Effect.gen(function* () {
 
 /** Ask every run still going to stop; force-close whatever hasn't reported a while later. */
 const deadline = Effect.gen(function* () {
-  if (!(yield* isDispatched)) return;
+  if ((yield* batchState)._tag !== "Dispatched") return;
   const batch = yield* Batch;
   const objects = yield* Objects;
   const runs = yield* (yield* Database).runsOfBatch(batch.name);
@@ -234,7 +246,8 @@ const deadline = Effect.gen(function* () {
 
 /** Runs that never reported after their abort are closed as timed out. */
 const forceClose = Effect.gen(function* () {
-  if (!(yield* isDispatched)) return;
+  const state = yield* batchState;
+  if (state._tag !== "Dispatched") return;
   const batch = yield* Batch;
   const db = yield* Database;
   for (const r of yield* db.runsOfBatch(batch.name)) {
@@ -244,7 +257,7 @@ const forceClose = Effect.gen(function* () {
     );
     yield* db.markRunStatus(r.runId, "timed_out", "no report after abort");
   }
-  yield* finalize;
+  yield* finalize(state);
 }).pipe(Effect.withSpan("Batch.forceClose"));
 
 const runJob = Match.type<Job>().pipe(
@@ -262,22 +275,14 @@ const runJob = Match.type<Job>().pipe(
  */
 export class DayCoordinator extends DurableObject<Env> {
   readonly lifecycle = Lifecycle.install(this);
-  readonly #batch = (() => {
-    const kv = this.ctx.storage.kv;
-    // Same keys as every earlier version, so existing batches keep working.
-    return {
-      config: stored(kv, "batch:config", BatchConfig),
-      game: stored(kv, "batch:game", TodayGame),
-      phase: stored(kv, "batch:phase", BatchPhase),
-      jobs: new JobQueue(() => this.lifecycle.jobs, Job),
-    };
-  })();
+  readonly #keys = batchKeys(this.ctx.storage.kv);
+  readonly #jobs = new JobQueue(() => this.lifecycle.jobs, Job);
   readonly #object = durableObjectRunner({
     tag: Batch,
-    service: () => Batch.of({ ...this.#batch, name: this.lifecycle.name }),
+    service: () => Batch.of({ ...this.#keys, jobs: this.#jobs, name: this.lifecycle.name }),
     annotations: () => ({ batch: this.lifecycle.name }),
     start: () => this.lifecycle.start(),
-    jobs: this.#batch.jobs,
+    jobs: this.#jobs,
     runJob,
   });
 

@@ -71,6 +71,13 @@ const call = <S extends Schema.Codec<any, any>>(
   );
 
 /**
+ * Objects are created near their first caller, wherever that ran. Pin them to North America
+ * so provider calls don't egress from a region a provider refuses (Gemini answers 400 "User
+ * location is not supported"). Only an object's first `get` applies the hint.
+ */
+const placement = { locationHint: "enam" } as const;
+
+/**
  * The Durable Objects, as Effects: a batch's `DayCoordinator` (named by the batch) and a
  * run's `DiveAgent` (named by `diveName`).
  */
@@ -79,7 +86,7 @@ export class Objects extends Context.Service<Objects>()("krillion/Objects", {
     const env = yield* WorkerEnv;
     return {
       coordinator: (batch: string) => {
-        const stub: DurableObjectStub<DayCoordinator> = env.DAY_COORDINATOR.getByName(batch);
+        const stub: DurableObjectStub<DayCoordinator> = env.DAY_COORDINATOR.getByName(batch, placement);
         return {
           start: (request: BatchRequest) => call("DayCoordinator.start", StartResult, () => stub.start(request)),
           status: () => call("DayCoordinator.status", BatchStatus, () => stub.status()),
@@ -88,7 +95,7 @@ export class Objects extends Context.Service<Objects>()("krillion/Objects", {
         };
       },
       dive: (name: string) => {
-        const stub: DurableObjectStub<DiveAgent> = env.DIVE_AGENT.getByName(name);
+        const stub: DurableObjectStub<DiveAgent> = env.DIVE_AGENT.getByName(name, placement);
         return {
           start: (input: RunInput) => call("DiveAgent.start", DiveStart, () => stub.start(input)),
           abort: () => call("DiveAgent.abort", Schema.Void, () => stub.abort()),

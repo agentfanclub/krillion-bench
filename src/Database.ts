@@ -5,6 +5,7 @@ import {
   type BatchConfig,
   type Day,
   ModelEntry,
+  isTerminal,
   RunStatus,
   type TerminalStatus,
   type RunSummary,
@@ -90,7 +91,7 @@ const MISS_EMOJI = "⬛";
 const countedRuns = (runs: ReadonlyArray<RunRow>): Array<RunRow> => {
   const counted = new Map<string, RunRow>();
   for (const r of runs) {
-    if (r.trial || r.status === "queued" || r.status === "running") continue;
+    if (r.trial || !isTerminal(r.status)) continue;
     const prev = counted.get(r.modelId);
     const better =
       prev === undefined ||

@@ -58,9 +58,8 @@ export interface CapturedSubmission extends Omit<Submission, "runId" | "day"> {
  * same session and finds the same tab by target id.
  */
 export class RunPage {
-  #pptr: PptrBrowser | undefined;
-  #page: Page | undefined;
-  #connecting: Promise<Page> | undefined;
+  /** Unset: disconnected; pending: connecting; resolved: connected (if still live). */
+  #connection: Promise<{ readonly pptr: PptrBrowser; readonly page: Page }> | undefined;
 
   constructor(
     private readonly binding: BrowserWorker,
@@ -70,11 +69,12 @@ export class RunPage {
   ) {}
 
   async page(): Promise<Page> {
-    if (this.#page && !this.#page.isClosed() && this.#pptr?.connected) return this.#page;
-    this.#connecting ??= this.#connect().finally(() => {
-      this.#connecting = undefined;
-    });
-    return this.#connecting;
+    const pending = this.#connection;
+    const current = await pending?.catch(() => undefined);
+    if (current && !current.page.isClosed() && current.pptr.connected) return current.page;
+    // Concurrent callers share one reconnect: only the first to see this stale connection replaces it.
+    if (this.#connection === pending || this.#connection === undefined) this.#connection = this.#connect();
+    return (await this.#connection).page;
   }
 
   /** Browser Run session id, for the runs row and recordings. */
@@ -82,7 +82,7 @@ export class RunPage {
     return (await this.browser.resolve()).sessionId;
   }
 
-  async #connect(): Promise<Page> {
+  async #connect(): Promise<{ pptr: PptrBrowser; page: Page }> {
     const { sessionId } = await this.browser.resolve();
     const pptr = await puppeteer.connect(this.binding, sessionId);
     const wanted = decodeTargetId(await this.storage.get(TARGET_KEY));
@@ -96,9 +96,7 @@ export class RunPage {
       await this.storage.put(TARGET_KEY, await targetId(page));
     }
     attachCapture(page, this.onSubmission);
-    this.#pptr = pptr;
-    this.#page = page;
-    return page;
+    return { pptr, page };
   }
 
   /** The game's own record of this player's dive (`localStorage["krillion:game:v1"]`). */
@@ -108,11 +106,10 @@ export class RunPage {
     return decodeGameState(await page.evaluate<[], () => string | null>(`localStorage.getItem("${GAME_STORAGE_KEY}")`));
   }
 
-  /** Drop the connection (not the browser). */
+  /** Drop the connection (not the browser), including one still being made. */
   disconnect(): void {
-    this.#pptr?.disconnect();
-    this.#pptr = undefined;
-    this.#page = undefined;
+    this.#connection?.then(({ pptr }) => pptr.disconnect()).catch(() => undefined);
+    this.#connection = undefined;
   }
 }
 
