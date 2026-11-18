@@ -8,7 +8,7 @@ import { BatchConfig, type BatchRequest, RunInput } from "./domain";
 // ── The Durable Objects' RPC contract. Results are decoded on the caller's side, since
 // the Worker and an object can run different versions during a rollout. ─────────────
 
-/** unset → "dispatched" → "finalized" | "failed" */
+/** unset → "dispatched" → "finalized"; unset → "failed". A rerun reopens "finalized" or "failed" (with a game) as "dispatched". */
 export const BatchPhase = Schema.Literals(["dispatched", "finalized", "failed"]);
 export type BatchPhase = typeof BatchPhase.Type;
 
@@ -30,7 +30,7 @@ export const RerunResult = Schema.Struct({
   skipped: Schema.Array(Schema.String),
 });
 
-/** Null when the batch is not a dispatched real day. */
+/** Null unless the batch is a real day that has its game. */
 export const Rerun = Schema.NullOr(RerunResult);
 export type Rerun = typeof Rerun.Type;
 

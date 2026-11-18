@@ -19,7 +19,7 @@ import { clip, logRecovered } from "../Logging";
  * - Gemini 3+ rejects a tool-call turn replayed without its `thought_signature`
  *   (`extra_content.google`), which Pi's chat-completions converter drops. Signatures
  *   are captured from responses by tool-call id and put back on requests; a call whose
- *   signature was lost (isolate restart) gets Google's documented skip value.
+ *   signature was lost (eviction) gets Google's documented skip value.
  * - Streamed tool-call deltas carry no `index`, so parallel calls would merge into one.
  */
 
@@ -173,9 +173,10 @@ const decodeChatRequest = Schema.decodeUnknownOption(Schema.fromJsonString(ChatR
 const decodeStreamEvent = Schema.decodeUnknownOption(Schema.fromJsonString(StreamEvent));
 const decodeJson = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
 
-const signatures = new Map<string, string>();
+/** Gemini thought signatures by tool-call id, oldest first; bounded. */
+type Signatures = Map<string, string>;
 
-function remember(id: string, signature: string): void {
+function remember(signatures: Signatures, id: string, signature: string): void {
   if (signatures.size >= MAX_SIGNATURES) {
     const oldest = signatures.keys().next().value;
     if (oldest !== undefined) signatures.delete(oldest);
@@ -189,7 +190,7 @@ const withSignature = (call: ToolCall, thought_signature: string): ToolCall => (
 });
 
 /** Put signatures back on replayed assistant tool calls. Google validates the first call of each step only. */
-const patchGeminiRequest = Effect.fnUntraced(function* (body: string) {
+const patchGeminiRequest = Effect.fnUntraced(function* (body: string, signatures: Signatures) {
   const request = decodeChatRequest(body);
   if (Option.isNone(request)) {
     yield* Effect.logWarning("gemini request body not patched: not a chat-completions body").pipe(
@@ -268,6 +269,8 @@ type GatewayAi = Ai & { fetch: (input: RequestInfo | URL, init?: RequestInit) =>
  */
 export function gatewayBinding(ai: Ai, { run, onProviderError }: GatewayHooks): Ai {
   const binding = ai as GatewayAi;
+  /** This run's signatures: a run only ever replays its own tool calls. */
+  const signatures: Signatures = new Map();
 
   /**
    * Pass an SSE stream through line by line: log provider error events, and for Gemini
@@ -282,9 +285,9 @@ export function gatewayBinding(ai: Ai, { run, onProviderError }: GatewayHooks): 
     const handleLine = (line: string): string => {
       if (!line.startsWith("data:")) return line;
       const data = line.slice(5).trim();
-      if (data === "" || data === "[DONE]") return line;
-      // Error events are rare; only parse what can be one, unless Gemini needs patching.
-      if (!gemini && !data.includes('"error"') && !data.includes("response.incomplete")) return line;
+      // Parse only what can need handling: error events (rare), and Gemini tool-call deltas.
+      const toolCalls = gemini && data.includes('"tool_calls"');
+      if (!toolCalls && !data.includes('"error"') && !data.includes("response.incomplete")) return line;
       const decoded = decodeStreamEvent(data);
       if (Option.isNone(decoded)) return line;
       const event = decoded.value;
@@ -298,21 +301,23 @@ export function gatewayBinding(ai: Ai, { run, onProviderError }: GatewayHooks): 
         );
         if (message) onProviderError(message, isRateLimit(error));
       }
-      if (!gemini || event.choices === undefined) return line;
+      if (!toolCalls || event.choices === undefined) return line;
+      let numbered = false;
       const choices = event.choices.map((choice) => {
         const calls = choice.delta?.tool_calls;
         if (calls === undefined) return choice;
-        const numbered = calls.map((call) => {
+        const indexed = calls.map((call) => {
           if (call.id === undefined) return call;
           const signature = call.extra_content?.google?.thought_signature;
-          if (signature) remember(call.id, signature);
+          if (signature) remember(signatures, call.id, signature);
           if (call.index !== undefined) return call;
           if (!indexOf.has(call.id)) indexOf.set(call.id, indexOf.size);
+          numbered = true;
           return { ...call, index: indexOf.get(call.id) };
         });
-        return { ...choice, delta: { ...choice.delta, tool_calls: numbered } };
+        return { ...choice, delta: { ...choice.delta, tool_calls: indexed } };
       });
-      return `data: ${JSON.stringify({ ...event, choices })}`;
+      return numbered ? `data: ${JSON.stringify({ ...event, choices })}` : line;
     };
 
     return body.pipeThrough(
@@ -372,7 +377,7 @@ export function gatewayBinding(ai: Ai, { run, onProviderError }: GatewayHooks): 
     const fields = { path: "fetch", provider, endpoint, requestModel };
     return run(
       Effect.gen(function* () {
-        const body = gemini && rawBody !== undefined ? yield* patchGeminiRequest(rawBody) : init?.body;
+        const body = gemini && rawBody !== undefined ? yield* patchGeminiRequest(rawBody, signatures) : init?.body;
         // Fail with the binding's own error, so Pi sees exactly what it would without this wrapper.
         const response = yield* Effect.tryPromise({ try: () => binding.fetch(input, { ...init, body }), catch: (e) => e }).pipe(
           Effect.tapError(logRecovered("ai gateway request threw")),

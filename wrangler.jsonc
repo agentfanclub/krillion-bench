@@ -6,7 +6,7 @@
   "compatibility_date": "2026-11-10",
   "compatibility_flags": ["nodejs_compat"],
   "upload_source_maps": true,
-  "observability": { "enabled": true },
+  "observability": { "enabled": true, "traces": { "enabled": true }, "issues": { "enabled": false } },
   "limits": { "cpu_ms": 300000 },
   // Leaderboard frontend (public/) served from the same Worker; /api/* and /admin* hit the Worker first.
   "assets": { "directory": "./public", "binding": "ASSETS", "run_worker_first": ["/api/*", "/admin", "/admin/*"] },

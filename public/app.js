@@ -18,8 +18,11 @@ function el(tag, className, text) {
   return node;
 }
 
+const running = status => status === 'queued' || status === 'running';
 // A run of a live day that hasn't finished yet.
-const inProgress = r => r.live === true && (r.status === 'queued' || r.status === 'running');
+const inProgress = r => r.live === true && running(r.status);
+// An accepted answer's comparison key (case-insensitive); null for misses.
+const answerKey = a => (a.outcome === 'accepted' && a.answer && a.answer.trim() ? a.answer.trim().toLowerCase() : null);
 const isPendingAnswer = a => a?.outcome === 'pending';
 
 function slot(emoji, pending) {
@@ -125,8 +128,8 @@ function renderCommon(day) {
   for (const r of day) {
     (r.answers || []).forEach((a, i) => {
       const p = prompts[i] ??= { prompt: a.prompt, counts: new Map() };
-      if (a.outcome !== 'accepted' || !a.answer || !a.answer.trim()) return;
-      const key = a.answer.trim().toLowerCase();
+      const key = answerKey(a);
+      if (!key) return;
       const entry = p.counts.get(key) ?? { answer: a.answer.trim(), n: 0, emoji: r.emojis[i] };
       entry.n++;
       p.counts.set(key, entry);
@@ -172,7 +175,6 @@ function svg(tag, attrs, text) {
   if (text !== undefined) node.textContent = text;
   return node;
 }
-const answerKey = a => (a.outcome === 'accepted' && a.answer && a.answer.trim() ? a.answer.trim().toLowerCase() : null);
 
 // X: score. Y: uniqueness, per accepted answer the share of the other models that didn't give it, averaged.
 function renderMap(day) {
@@ -330,25 +332,18 @@ function render() {
   $('result-count').textContent = `${visible.length} result${visible.length === 1 ? '' : 's'}`;
 }
 
-// Charts compare final scores, so they skip runs still going.
-function renderRound() {
-  showAll = false;
+// Charts compare final scores, so they skip runs still going. A refresh after a poll
+// keeps open rows, revealed questions and Show All.
+function renderRound(refresh = false) {
+  const openRows = refresh ? new Set([...$('results').querySelectorAll('details[open]')].map(d => d.closest('.row').dataset.id)) : new Set();
+  const picks = refresh ? [...$('picks').children].map(item => ({ shown: item.classList.contains('shown'), open: item.querySelector('details').open })) : [];
+  const showing = refresh && $('show-questions').getAttribute('aria-pressed') === 'true';
+  if (!refresh) showAll = false;
   const day = roundResults();
   const finished = day.filter(r => !inProgress(r));
   renderChart(finished);
   renderCommon(day);
   renderMap(finished);
-  render();
-}
-
-// Refresh in place after a poll: keep open rows, revealed questions and Show All.
-function refreshRound() {
-  const openRows = new Set([...$('results').querySelectorAll('details[open]')].map(d => d.closest('.row').dataset.id));
-  const picks = [...$('picks').children].map(item => ({ shown: item.classList.contains('shown'), open: item.querySelector('details').open }));
-  const showing = $('show-questions').getAttribute('aria-pressed') === 'true';
-  const keepAll = showAll;
-  renderRound();
-  showAll = keepAll;
   render();
   for (const row of $('results').children) if (openRows.has(row.dataset.id)) row.querySelector('details').open = true;
   [...$('picks').children].forEach((item, i) => {
@@ -361,7 +356,7 @@ function refreshRound() {
 
 $('search').addEventListener('input', render);
 $('sort').addEventListener('change', render);
-$('round').addEventListener('change', renderRound);
+$('round').addEventListener('change', () => renderRound());
 $('show-questions').addEventListener('click', () => {
   const showing = $('show-questions').getAttribute('aria-pressed') !== 'true';
   for (const item of $('picks').children) (showing ? showQuestion : hideQuestion)(item);
@@ -388,7 +383,7 @@ function renderLiveBanner() {
   const going = live !== null && !live.complete && live.results.length > 0;
   $('live-banner').hidden = !going;
   if (!going) return;
-  const finished = live.results.filter(r => r.status !== 'queued' && r.status !== 'running').length;
+  const finished = live.results.filter(r => !running(r.status)).length;
   $('live-detail').textContent = `Krillion #${live.round} · ${finished} of ${live.results.length} models finished · updates every 30 s`;
 }
 
@@ -427,7 +422,7 @@ function schedulePoll() {
       merge();
       fillRounds();
       renderLiveBanner();
-      if ($('round').value === before) refreshRound(); else renderRound();
+      renderRound($('round').value === before);
     } catch (error) {
       console.error(error);
     }

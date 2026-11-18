@@ -2,9 +2,10 @@ const $ = (id) => document.getElementById(id);
 const THINKING = ['', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 let roster = { version: 1, models: [] };
 let catalog = [];
-let dirty = false;
-// Saving replaces the whole KV document: never save over a roster we couldn't load.
-let rosterLoaded = false;
+// 'unloaded' → 'clean' ⇄ 'dirty' ⇄ 'saving'. Saving replaces the whole KV document: never save over a roster we couldn't load.
+let rosterState = 'unloaded';
+// Bumped on every edit, so a save that finishes after more edits leaves the roster dirty.
+let revision = 0;
 
 function el(tag, props = {}, ...children) {
   const node = Object.assign(document.createElement(tag), props);
@@ -26,16 +27,25 @@ function flash(message, isError = false) {
   node.hidden = false;
 }
 
-function markDirty() {
-  dirty = true;
-  $('save').disabled = false;
+function setRosterState(state) {
+  rosterState = state;
+  $('add').disabled = state === 'unloaded';
+  $('save').disabled = state !== 'dirty';
 }
+
+function edited() {
+  revision++;
+  if (rosterState !== 'saving') setRosterState('dirty');
+  renderRoster();
+}
+
+const unsaved = () => rosterState === 'dirty' || rosterState === 'saving';
 
 // ── Roster ───────────────────────────────────────────────────────────────────
 
 function renderRoster() {
   $('models').replaceChildren(...roster.models.map((m, i) => {
-    const update = (patch) => { roster.models[i] = { ...roster.models[i], ...patch }; markDirty(); renderRoster(); };
+    const update = (patch) => { roster.models[i] = { ...roster.models[i], ...patch }; edited(); };
     const thinking = el('select', { onchange: (e) => update({ thinkingLevel: e.target.value || undefined }) },
       ...THINKING.map(t => el('option', { value: t, textContent: t || 'default', selected: (m.thinkingLevel ?? '') === t })));
     return el('tr', { className: m.enabled ? '' : 'off' },
@@ -46,7 +56,7 @@ function renderRoster() {
       el('td', {}, el('input', { type: 'checkbox', checked: !!m.vision, onchange: (e) => update({ vision: e.target.checked }) })),
       el('td', {}, thinking),
       el('td', {}, el('button', { type: 'button', className: 'link', textContent: 'remove', onclick: () => {
-        roster.models.splice(i, 1); markDirty(); renderRoster(); renderCatalog();
+        roster.models.splice(i, 1); edited(); renderCatalog();
       } })),
     );
   }));
@@ -70,50 +80,60 @@ $('catalog').addEventListener('change', () => {
   $('add-label').value = id ? id.split('/').pop() : '';
 });
 
+
 $('add').addEventListener('click', () => {
   const id = $('catalog').value;
-  if (!rosterLoaded) return flash('The roster did not load; fix it before editing.', true);
   if (!id) return flash('Pick a model to add.', true);
   const info = catalog.find(c => c.id === id);
   roster.models.push({ id, label: $('add-label').value.trim() || id, enabled: true, vision: !!info?.vision });
   $('add-label').value = '';
-  markDirty(); renderRoster(); renderCatalog();
+  edited(); renderCatalog();
 });
 
 $('save').addEventListener('click', async () => {
-  if (!rosterLoaded) return flash('The roster did not load; fix it before saving.', true);
+  const saving = revision;
+  setRosterState('saving');
   try {
     const clean = { version: 1, models: roster.models.map(({ thinkingLevel, ...m }) => thinkingLevel ? { ...m, thinkingLevel } : m) };
-    roster = await api('/models', { method: 'PUT', body: JSON.stringify(clean) });
-    dirty = false; $('save').disabled = true;
-    renderRoster();
-    flash(`Saved ${roster.models.length} models (${roster.models.filter(m => m.enabled).length} enabled).`);
-  } catch (e) { flash(`Save failed: ${e.message}`, true); }
+    const saved = await api('/models', { method: 'PUT', body: JSON.stringify(clean) });
+    // Edits made while saving stay local and unsaved; otherwise take the server's copy.
+    if (revision === saving) { roster = saved; setRosterState('clean'); renderRoster(); } else setRosterState('dirty');
+    flash(`Saved ${saved.models.length} models (${saved.models.filter(m => m.enabled).length} enabled).`);
+  } catch (e) {
+    setRosterState('dirty');
+    flash(`Save failed: ${e.message}`, true);
+  }
 });
 
-window.addEventListener('beforeunload', (e) => { if (dirty) e.preventDefault(); });
+window.addEventListener('beforeunload', (e) => { if (unsaved()) e.preventDefault(); });
 
 // ── Runs ─────────────────────────────────────────────────────────────────────
 
-$('run-trial').addEventListener('click', async () => {
-  if (dirty) return flash('Save the roster first: runs read the saved roster.', true);
-  const models = [...document.querySelectorAll('.trial-pick:checked')].map(c => c.value);
+// POST a run with its button disabled while in flight. Runs read the saved roster.
+async function startRun(button, body, describe) {
+  if (unsaved()) return flash('Save the roster first: runs read the saved roster.', true);
+  button.disabled = true;
   try {
-    const r = await api('/runs', { method: 'POST', body: JSON.stringify({ kind: 'trial', models }) });
-    flash(`Started trial ${r.batch} (${models.length || 'all enabled'} model${models.length === 1 ? '' : 's'}).`);
+    flash(describe(await api('/runs', { method: 'POST', body: JSON.stringify(body) })));
     loadBatches();
-  } catch (e) { flash(`Trial failed: ${e.message}`, true); }
+  } catch (e) {
+    flash(`Run failed: ${e.message}`, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+$('run-trial').addEventListener('click', (e) => {
+  const models = [...document.querySelectorAll('.trial-pick:checked')].map(c => c.value);
+  startRun(e.currentTarget, { kind: 'trial', models },
+    (r) => `Started trial ${r.batch} (${models.length || 'all enabled'} model${models.length === 1 ? '' : 's'}).`);
 });
 
-$('run-day-btn').addEventListener('click', async () => {
-  if (dirty) return flash('Save the roster first: runs read the saved roster.', true);
+$('run-day-btn').addEventListener('click', (e) => {
   const day = $('run-day').value;
-  if (!confirm(`Start the ranked batch for ${day}? It counts on the leaderboard.`)) return;
-  try {
-    const r = await api('/runs', { method: 'POST', body: JSON.stringify({ kind: 'day', day }) });
-    flash(r.accepted ? `Started ${r.batch}.` : `${r.batch} already exists; nothing started.`);
-    loadBatches();
-  } catch (e) { flash(`Run failed: ${e.message}`, true); }
+  if (!unsaved() && !confirm(`Start the ranked batch for ${day}? It counts on the leaderboard.`)) return;
+  startRun(e.currentTarget, { kind: 'day', day },
+    (r) => r.accepted ? `Started ${r.batch}.` : `${r.batch} already exists; nothing started.`);
 });
 
 // ── Batches ──────────────────────────────────────────────────────────────────
@@ -121,6 +141,9 @@ $('run-day-btn').addEventListener('click', async () => {
 async function showBatch(li, name) {
   const existing = li.querySelector('table');
   if (existing) return existing.remove();
+  // A second click while loading would append a second table.
+  if (li.dataset.loading) return;
+  li.dataset.loading = 'true';
   try {
     const b = await api(`/batch?name=${encodeURIComponent(name)}`);
     const rows = b.runs.map(r => el('tr', {},
@@ -132,13 +155,21 @@ async function showBatch(li, name) {
       el('thead', {}, el('tr', {}, ...['Model', 'Try', 'Status', 'Score'].map(h => el('th', { textContent: h })))),
       el('tbody', {}, ...rows)));
     li.querySelector('.tag.phase').textContent = b.phase ?? 'starting';
-  } catch (e) { flash(`Couldn't load ${name}: ${e.message}`, true); }
+  } catch (e) {
+    flash(`Couldn't load ${name}: ${e.message}`, true);
+  } finally {
+    delete li.dataset.loading;
+  }
 }
 
+// Refresh and post-run reloads can overlap; only the latest one renders.
+let batchesRequest = 0;
 async function loadBatches() {
+  const request = ++batchesRequest;
   try {
     const batches = await api('/batches');
-    $('batches').replaceChildren(...batches.map(b => {
+    if (request !== batchesRequest) return;
+    $('batches').replaceChildren(...(batches.length ? batches.map(b => {
       const li = el('li');
       li.append(el('div', { className: 'batch-head' },
         el('button', { type: 'button', className: 'link name', textContent: b.batch, onclick: () => showBatch(li, b.batch) }),
@@ -147,9 +178,10 @@ async function loadBatches() {
         el('span', { className: 'tag', textContent: new Date(b.createdAt).toLocaleString() }),
         el('span', { className: 'tag phase', textContent: '' })));
       return li;
-    }));
-    if (!batches.length) $('batches').append(el('li', { className: 'hint', textContent: 'No batches yet.' }));
-  } catch (e) { flash(`Couldn't load batches: ${e.message}`, true); }
+    }) : [el('li', { className: 'hint', textContent: 'No batches yet.' })]));
+  } catch (e) {
+    if (request === batchesRequest) flash(`Couldn't load batches: ${e.message}`, true);
+  }
 }
 $('refresh').addEventListener('click', loadBatches);
 
@@ -162,15 +194,17 @@ async function init() {
     const me = await api('/me');
     $('who').textContent = `Signed in as ${me.email}`;
   } catch (e) { $('who').textContent = `Not authorized: ${e.message}`; return; }
-  try {
-    roster = await api('/models');
-    rosterLoaded = true;
+  // Independent loads, started together.
+  api('/models').then((loaded) => {
+    roster = loaded;
+    setRosterState('clean');
     renderRoster();
-  } catch (e) { flash(`Couldn't load roster: ${e.message}`, true); }
-  try {
-    catalog = await api('/catalog');
     renderCatalog();
-  } catch (e) { flash(`Couldn't load catalog: ${e.message}`, true); }
+  }, (e) => flash(`Couldn't load roster: ${e.message}`, true));
+  api('/catalog').then((loaded) => {
+    catalog = loaded;
+    renderCatalog();
+  }, (e) => flash(`Couldn't load catalog: ${e.message}`, true));
   loadBatches();
 }
 init();

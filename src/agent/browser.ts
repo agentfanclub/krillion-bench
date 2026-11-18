@@ -1,4 +1,9 @@
-import puppeteer, { type Browser as PptrBrowser, type BrowserWorker, type Page } from "@cloudflare/puppeteer";
+import puppeteer, {
+  type Browser as PptrBrowser,
+  type BrowserWorker,
+  type HTTPResponse,
+  type Page,
+} from "@cloudflare/puppeteer";
 import type { Browser } from "agents/browser";
 import { Option, Schema } from "effect";
 import { KRILLION_ORIGIN, type Submission } from "../domain";
@@ -48,6 +53,11 @@ export interface CapturedSubmission extends Omit<Submission, "runId" | "day"> {
   readonly date: string;
 }
 
+type Connection = { readonly pptr: PptrBrowser; readonly page: Page };
+
+/** A submit request on its way: when it left, its `seq`, and the answer clock read then. */
+type Outgoing = { readonly at: number; readonly seq: number; readonly clock: Promise<number | null> };
+
 /**
  * The run's one tab, over a Puppeteer connection to the Browser Run session the
  * agents-SDK `Browser` owns. The SDK keeps the session record (guardrails,
@@ -59,21 +69,32 @@ export interface CapturedSubmission extends Omit<Submission, "runId" | "day"> {
  */
 export class RunPage {
   /** Unset: disconnected; pending: connecting; resolved: connected (if still live). */
-  #connection: Promise<{ readonly pptr: PptrBrowser; readonly page: Page }> | undefined;
+  #connection: Promise<Connection> | undefined;
+  /** Set by `close()`, for good: no new connection or capture after it. */
+  #closed = false;
+  /** Capture handlers still reading a response or recording it. */
+  readonly #captures = new Set<Promise<void>>();
+  /** Last submission `seq` handed out: the request time, bumped so two submits in one ms can't share a key. */
+  #seq = 0;
 
   constructor(
     private readonly binding: BrowserWorker,
     private readonly browser: Browser,
     private readonly storage: DurableObjectStorage,
-    private readonly onSubmission: (s: CapturedSubmission) => void,
+    /** Records one submission; capture awaits it, so `close()` waits for the write. */
+    private readonly onSubmission: (s: CapturedSubmission) => Promise<void>,
   ) {}
 
   async page(): Promise<Page> {
     const pending = this.#connection;
     const current = await pending?.catch(() => undefined);
+    if (this.#closed) throw new Error("the run's browser connection is closed");
     if (current && !current.page.isClosed() && current.pptr.connected) return current.page;
     // Concurrent callers share one reconnect: only the first to see this stale connection replaces it.
-    if (this.#connection === pending || this.#connection === undefined) this.#connection = this.#connect();
+    if (this.#connection === pending || this.#connection === undefined) {
+      void current?.pptr.disconnect().catch(() => undefined); // a closed tab leaves its connection open
+      this.#connection = this.#connect();
+    }
     return (await this.#connection).page;
   }
 
@@ -82,20 +103,25 @@ export class RunPage {
     return (await this.browser.resolve()).sessionId;
   }
 
-  async #connect(): Promise<{ pptr: PptrBrowser; page: Page }> {
+  async #connect(): Promise<Connection> {
     const { sessionId } = await this.browser.resolve();
     const pptr = await puppeteer.connect(this.binding, sessionId);
     const wanted = decodeTargetId(await this.storage.get(TARGET_KEY));
     let page: Page | undefined;
-    for (const p of await pptr.pages()) {
-      if (Option.isSome(wanted) && (await targetId(p)) === wanted.value) page = p;
+    if (Option.isSome(wanted)) {
+      for (const p of await pptr.pages()) {
+        if ((await targetId(p)) === wanted.value) {
+          page = p;
+          break;
+        }
+      }
     }
     if (!page) {
       page = await pptr.newPage();
       await page.setViewport({ width: 1280, height: 900 });
       await this.storage.put(TARGET_KEY, await targetId(page));
     }
-    attachCapture(page, this.onSubmission);
+    this.#capture(page);
     return { pptr, page };
   }
 
@@ -106,10 +132,84 @@ export class RunPage {
     return decodeGameState(await page.evaluate<[], () => string | null>(`localStorage.getItem("${GAME_STORAGE_KEY}")`));
   }
 
-  /** Drop the connection (not the browser), including one still being made. */
-  disconnect(): void {
-    this.#connection?.then(({ pptr }) => pptr.disconnect()).catch(() => undefined);
+  /**
+   * Stop capturing, drop the connection (not the browser), including one still being
+   * made, and wait until every submission seen is recorded. Final: `page()` fails after.
+   */
+  async close(): Promise<void> {
+    this.#closed = true;
+    // Responses already arriving read their body over the connection: let them finish first.
+    await this.#settleCaptures();
+    const connection = this.#connection;
     this.#connection = undefined;
+    await connection?.then(({ pptr }) => pptr.disconnect()).catch(() => undefined);
+    await this.#settleCaptures();
+  }
+
+  async #settleCaptures(): Promise<void> {
+    while (this.#captures.size > 0) await Promise.allSettled(this.#captures);
+  }
+
+  /**
+   * Record every `/api/submit` exchange from the network. The model never sees this
+   * path: it reads Krillion's own response, so scores never depend on the model's
+   * account of them.
+   */
+  #capture(page: Page): void {
+    const outgoing = new WeakMap<object, Outgoing>();
+
+    page.on("request", (req) => {
+      if (this.#closed || req.method() !== "POST" || !req.url().endsWith(SUBMIT_PATH)) return;
+      // Read the answer clock as the request leaves; the game clears it once answered.
+      const clock = page
+        .evaluate<[], () => number | null>(`(() => {
+          const raw = localStorage.getItem("${GAME_STORAGE_KEY}");
+          const ends = raw ? JSON.parse(raw).answerEndsAt : null;
+          return typeof ends === "number" ? ends : null;
+        })()`)
+        .catch(() => null);
+      const at = Date.now();
+      this.#seq = Math.max(at, this.#seq + 1);
+      outgoing.set(req, { at, seq: this.#seq, clock });
+    });
+
+    page.on("response", (res) => {
+      const sent = outgoing.get(res.request());
+      if (!sent) return;
+      const capture = this.#record(res, sent).finally(() => this.#captures.delete(capture));
+      this.#captures.add(capture);
+    });
+  }
+
+  async #record(res: HTTPResponse, sent: Outgoing): Promise<void> {
+    const body = decodeSubmitRequest(res.request().postData() ?? "");
+    if (Option.isNone(body)) return;
+    const status = res.status();
+    const parsed = Option.getOrUndefined(decodeSubmitResponse(await res.text().catch(() => "")));
+    const endsAt = await sent.clock;
+    const kind: Submission["kind"] =
+      status !== 200 || !parsed
+        ? "error"
+        : parsed.accepted === true
+          ? "accepted"
+          : parsed.correction
+            ? "correction"
+            : "rejected";
+    await this.onSubmission({
+      seq: sent.seq,
+      date: body.value.date,
+      promptId: body.value.promptId,
+      submittedAt: new Date(sent.at).toISOString(),
+      rawAnswer: body.value.answer,
+      kind,
+      canonical: parsed?.answer ?? null,
+      correction: parsed?.correction ?? null,
+      tier: parsed?.tier ?? null,
+      score: parsed?.score ?? null,
+      httpStatus: status,
+      latencyMs: Date.now() - sent.at,
+      clockMs: endsAt === null ? null : sent.at - (endsAt - ANSWER_WINDOW_MS),
+    });
   }
 }
 
@@ -121,60 +221,4 @@ async function targetId(page: Page): Promise<string> {
   } finally {
     await cdp.detach().catch(() => undefined);
   }
-}
-
-/**
- * Record every `/api/submit` exchange from the network. The model never sees this
- * path: it reads Krillion's own response, so scores never depend on the model's
- * account of them.
- */
-function attachCapture(page: Page, onSubmission: (s: CapturedSubmission) => void): void {
-  const started = new WeakMap<object, { at: number; clock: Promise<number | null> }>();
-
-  page.on("request", (req) => {
-    if (req.method() !== "POST" || !req.url().endsWith(SUBMIT_PATH)) return;
-    // Read the answer clock as the request leaves; the game clears it once answered.
-    const clock = page
-      .evaluate<[], () => number | null>(`(() => {
-        const raw = localStorage.getItem("${GAME_STORAGE_KEY}");
-        const ends = raw ? JSON.parse(raw).answerEndsAt : null;
-        return typeof ends === "number" ? ends : null;
-      })()`)
-      .catch(() => null);
-    started.set(req, { at: Date.now(), clock });
-  });
-
-  page.on("response", async (res) => {
-    const req = res.request();
-    const start = started.get(req);
-    if (!start) return;
-    const body = decodeSubmitRequest(req.postData() ?? "");
-    if (Option.isNone(body)) return;
-    const status = res.status();
-    const parsed = Option.getOrUndefined(decodeSubmitResponse(await res.text().catch(() => "")));
-    const endsAt = await start.clock;
-    const kind: Submission["kind"] =
-      status !== 200 || !parsed
-        ? "error"
-        : parsed.accepted === true
-          ? "accepted"
-          : parsed.correction
-            ? "correction"
-            : "rejected";
-    onSubmission({
-      seq: start.at,
-      date: body.value.date,
-      promptId: body.value.promptId,
-      submittedAt: new Date(start.at).toISOString(),
-      rawAnswer: body.value.answer,
-      kind,
-      canonical: parsed?.answer ?? null,
-      correction: parsed?.correction ?? null,
-      tier: parsed?.tier ?? null,
-      score: parsed?.score ?? null,
-      httpStatus: status,
-      latencyMs: Date.now() - start.at,
-      clockMs: endsAt === null ? null : start.at - (endsAt - ANSWER_WINDOW_MS),
-    });
-  });
 }

@@ -7,7 +7,7 @@ import { PiHarness, type PiOperationResult } from "agents/harness/pi";
 import { Lifecycle, type LifecycleJobContext, type LifecycleJobOutcome } from "agents/lifecycle";
 import { type AI, createAI } from "agents/models/pi-ai";
 import { DurableObject } from "cloudflare:workers";
-import { Cause, Clock, Context, type Data, Effect, FiberSet, Match, Option, Schema, Scope } from "effect";
+import { Cause, Clock, Context, type Data, Effect, Match, Option, Schema } from "effect";
 import { durableObjectRunner } from "../App";
 import { JobQueue, stored } from "../Cloudflare";
 import { Database, type SubmissionResult } from "../Database";
@@ -18,6 +18,7 @@ import { type CapturedSubmission, type GameState, RunPage } from "./browser";
 import { gatewayBinding, rosterModel } from "./gateway";
 import { NUDGE, PROMPT } from "./prompt";
 import { browserExtension } from "./tools";
+import { scorePrompt } from "../scoring";
 
 const WATCH_EVERY_MS = 10_000;
 /** Hard ceiling per run, independent of the coordinator's deadline. A dive takes ~4 min. */
@@ -37,53 +38,110 @@ const Job = Schema.Union([
 ]);
 type Job = typeof Job.Type;
 
-/** The agent's durable state (same keys as every earlier version). */
+/** The agent's durable state (same keys as every earlier version, plus the finalize keys). */
 const runState = (kv: SyncKvStorage) => ({
   input: stored(kv, "run:input", RunInput),
   phase: stored(kv, "run:phase", DivePhase),
   startedAt: stored(kv, "run:startedAt", Schema.Number),
   steps: stored(kv, "run:steps", Schema.Number, 0),
+  /** Nudges actually handed to Pi (set after each submit), so the last operation is real. */
   nudges: stored(kv, "run:nudges", Schema.Number, 0),
   /** The last provider error message the gateway wrapper saw (its own words, not Pi's). */
   providerError: stored(kv, "run:lastProviderError", Schema.String),
   /** Set once any provider call of this run was rate limited. */
   rateLimited: stored(kv, "run:rateLimited", Schema.Boolean, false),
+  /** Why the run ended, recorded once before finalize starts; the first reason wins. */
+  finalizeReason: stored(kv, "run:finalizeReason", FinalizeReason),
+  /** Our own error that ended the run (a failed begin). */
+  finalizeError: stored(kv, "run:finalizeError", Schema.String),
 });
+type RunState = ReturnType<typeof runState>;
 
 /** This agent: its state, harness, browser, and job queue. */
 class Dive extends Context.Service<
   Dive,
   {
-    readonly state: ReturnType<typeof runState>;
+    readonly state: RunState;
     readonly harness: PiHarness;
     readonly browser: Browser;
     readonly page: RunPage;
     readonly ai: AI;
     readonly jobs: JobQueue<Job>;
-    /** Submission writes in flight; finalize waits for them. */
-    readonly writes: FiberSet.FiberSet<void>;
     /** (Re)install the browser tools: the vision flag comes from the stored input. */
     readonly installTools: () => void;
   }
 >()("krillion/Dive") {}
 
-/** Decoded from the stored keys: New → Accepted → Running → Finalized; a failed begin finalizes from Accepted. */
+/**
+ * Decoded from the stored keys: New → Accepted → Running → Finalizing → Finalized.
+ * Accepted can go straight to Finalizing (a failed begin, or an abort before the prompt).
+ */
 type DiveState = Data.TaggedEnum<{
   New: {};
   Accepted: { readonly input: RunInput };
   Running: { readonly input: RunInput; readonly startedAt: number };
+  Finalizing: { readonly input: RunInput; readonly reason: FinalizeReason; readonly error: string | undefined };
   Finalized: { readonly input: RunInput };
 }>;
 
-const diveState = Dive.useSync(({ state }): DiveState => {
+const decodeState = (state: RunState): DiveState => {
   const input = state.input.getUnsafe();
   if (Option.isNone(input)) return { _tag: "New" };
   const phase = state.phase.getUnsafe();
   if (Option.contains(phase, "finalized")) return { _tag: "Finalized", input: input.value };
+  const reason = state.finalizeReason.getUnsafe();
+  if (Option.isSome(reason)) {
+    const error = Option.getOrUndefined(state.finalizeError.getUnsafe());
+    return { _tag: "Finalizing", input: input.value, reason: reason.value, error };
+  }
   const startedAt = state.startedAt.getUnsafe();
   return Option.contains(phase, "running") && Option.isSome(startedAt)
     ? { _tag: "Running", input: input.value, startedAt: startedAt.value }
     : { _tag: "Accepted", input: input.value };
+};
+
+const diveState = Dive.useSync(({ state }) => decodeState(state));
+
+/**
+ * Accepted → Running, unless the run moved on meanwhile (an abort while begin awaited).
+ * One synchronous read-and-write, so nothing interleaves between the check and the transition.
+ */
+const markStarted = (now: number) =>
+  Dive.useSync(({ state }) => {
+    if (decodeState(state)._tag !== "Accepted") return;
+    state.startedAt.setUnsafe(now);
+    state.phase.setUnsafe("running");
+  });
+
+/**
+ * Accepted | Running → Finalizing: record why the run ended, unless an earlier end
+ * already did (first reason wins). Synchronous, like `markStarted`. The reason to
+ * finalize with, or undefined when there is no run to finalize.
+ */
+const recordEnd = (reason: FinalizeReason, error?: unknown) =>
+  Dive.useSync(({ state }): FinalizeReason | undefined => {
+    const current = decodeState(state);
+    switch (current._tag) {
+      case "Accepted":
+      case "Running":
+        state.finalizeReason.setUnsafe(reason);
+        if (error !== undefined) state.finalizeError.setUnsafe(String(error));
+        return reason;
+      case "Finalizing":
+        return current.reason;
+      default:
+        return undefined;
+    }
+  });
+
+/**
+ * End the run: record why, then queue the finalize job. Finalize runs only as that job
+ * (jobs run one at a time), so no two ends can both run it; an eviction mid-finalize
+ * leaves the job and the reason in place, and the retried job resumes it.
+ */
+const endRun = Effect.fn("Dive.endRun")(function* (reason: FinalizeReason, error?: unknown) {
+  const recorded = yield* recordEnd(reason, error);
+  if (recorded !== undefined) yield* (yield* Dive).jobs.push({ fn: "finalize", payload: recorded });
 });
 
 /** Pi operation id of the prompt (nudge 0) or of a nudge. */
@@ -165,25 +223,10 @@ const promptResults = (
   game: GameState | undefined,
 ): Array<PromptResult> =>
   input.prompts.map((p, i): PromptResult => {
-    const mine = subs.filter((s) => s.promptId === p.id);
-    const accepted = mine.find((s) => s.kind === "accepted");
     const fromGame = game?.results?.find((r) => r.promptId === p.id);
-    const base = { promptId: p.id, attempts: mine.length, msToAccept: null };
-    if (accepted) {
-      return {
-        ...base,
-        outcome: "accepted",
-        answer: accepted.canonical,
-        tier: accepted.tier,
-        score: accepted.score ?? 0,
-        msToAccept: accepted.clockMs,
-      };
-    }
-    if (fromGame?.answer && fromGame.score) {
-      return { ...base, outcome: "accepted", answer: fromGame.answer, tier: fromGame.tier ?? null, score: fromGame.score };
-    }
-    const reached = mine.length > 0 || fromGame !== undefined || (game?.roundIndex ?? -1) > i;
-    return { ...base, outcome: reached ? "timed_out" : "not_reached", answer: null, tier: null, score: 0 };
+    const result = scorePrompt(p.id, subs, fromGame !== undefined || (game?.roundIndex ?? -1) > i);
+    if (result.outcome === "accepted" || !fromGame?.answer || !fromGame.score) return result;
+    return { ...result, outcome: "accepted", answer: fromGame.answer, tier: fromGame.tier ?? null, score: fromGame.score };
   });
 
 /** The page's game state, when it is this run's dive. */
@@ -194,27 +237,36 @@ const todaysGame = (input: RunInput) =>
 
 /** The run's error message: ours, else the provider's, else Pi's outcome for infra errors. */
 const runError = (
-  error: unknown,
+  error: string | undefined,
   failures: ReadonlyArray<ModelFailure>,
   providerError: string | undefined,
   status: TerminalStatus,
   piOutcome: string,
 ): string | null => {
-  if (error !== undefined) return String(error);
+  if (error !== undefined) return error;
   if (failures.length > 0) return providerError ?? failures.at(-1)?.errorMessage ?? null;
   return status === "infra_error" ? piOutcome : null;
 };
 
-/** Stop the model, score the run from captured submissions, record it, close the browser, tell the coordinator. */
-const finalize = Effect.fn("Dive.finalize")(function* (reason: FinalizeReason, error?: unknown) {
+/**
+ * Stop the model, score the run from captured submissions, record it, close the browser,
+ * tell the coordinator. Runs only as the finalize job; safe to rerun until it marks the
+ * run finalized (the summary write is an upsert).
+ */
+const finalize = Effect.fn("Dive.finalize")(function* ({
+  input,
+  reason,
+  error,
+}: Data.TaggedEnum.Value<DiveState, "Finalizing">) {
   const dive = yield* Dive;
   const { state, harness } = dive;
-  const current = yield* diveState;
-  if (current._tag === "New" || current._tag === "Finalized") return;
-  const { input } = current;
   const db = yield* Database;
 
-  if (reason !== "ended") yield* Effect.tryPromise(() => harness.abort()).pipe(orWarn("harness abort failed", false));
+  if (reason !== "ended") {
+    yield* Effect.tryPromise(() => harness.abort()).pipe(
+      Effect.ignore({ log: "Warn", message: "harness abort failed" }),
+    );
+  }
   const lastOp = operationOf(input.runId, yield* state.nudges.get);
   const outcome = yield* Effect.tryPromise((signal) => harness.wait(lastOp, { signal })).pipe(
     Effect.timeout("30 seconds"),
@@ -222,7 +274,9 @@ const finalize = Effect.fn("Dive.finalize")(function* (reason: FinalizeReason, e
     Effect.annotateLogs({ operationId: lastOp }),
   );
   const game = yield* todaysGame(input).pipe(orWarn("could not read game state at finalize", Option.none()));
-  yield* FiberSet.awaitEmpty(dive.writes);
+  // Stop capture before reading submissions: once this returns, every submission the
+  // page saw is in D1 and no tool can reopen the connection.
+  yield* Effect.promise(() => dive.page.close());
 
   const subs = yield* db.submissionsOfRun(input.runId);
   const results = promptResults(input, subs, Option.getOrUndefined(game));
@@ -289,7 +343,6 @@ const finalize = Effect.fn("Dive.finalize")(function* (reason: FinalizeReason, e
   );
   yield* state.phase.set("finalized");
 
-  dive.page.disconnect();
   yield* Effect.tryPromise(() => dive.browser.close()).pipe(Effect.ignore);
   yield* (yield* Objects)
     .coordinator(input.batch)
@@ -297,17 +350,19 @@ const finalize = Effect.fn("Dive.finalize")(function* (reason: FinalizeReason, e
     .pipe(Effect.catchTag("RpcError", logRecovered("coordinator notify failed")));
 });
 
-/** Open the browser, set the model, and hand Pi the prompt; then start watching. */
+/**
+ * Open the browser, set the model, start the clock, hand Pi the prompt, then start watching.
+ * Resumable: rerun after an eviction from Running, it resubmits the prompt (Pi admits an
+ * operation id once) and schedules the watch it may never have scheduled.
+ */
 const begin = Effect.gen(function* () {
   const dive = yield* Dive;
-  const { state, harness } = dive;
-  const current = yield* diveState;
-  if (current._tag !== "Accepted") return;
-  const { input } = current;
-  const db = yield* Database;
-  const started = yield* Effect.gen(function* () {
+  const { harness } = dive;
+  const accepted = yield* diveState;
+  if (accepted._tag === "Accepted") {
+    const { input } = accepted;
     yield* Effect.tryPromise(() => dive.page.page()); // open the browser before the model's clock starts
-    yield* db.markRunning(input.runId, yield* Effect.tryPromise(() => dive.page.sessionId()));
+    yield* (yield* Database).markRunning(input.runId, yield* Effect.tryPromise(() => dive.page.sessionId()));
     yield* Effect.tryPromise(() => harness.session().setModel(rosterModel(dive.ai, input.model.id)));
     const thinkingLevel = input.model.thinkingLevel;
     if (thinkingLevel) {
@@ -316,21 +371,22 @@ const begin = Effect.gen(function* () {
         await root.configure({ thinkingLevel }, BACKGROUND_CONTEXT);
       });
     }
-    yield* state.startedAt.set(yield* Clock.currentTimeMillis);
-    yield* state.phase.set("running");
-    yield* Effect.tryPromise(() => harness.submit(PROMPT, { operationId: input.runId }));
-  }).pipe(
-    Effect.as(true),
-    Effect.catchCause((cause) => {
-      const error = Cause.squash(cause);
-      return Effect.logError("dive begin failed", cause).pipe(
-        Effect.andThen(finalize("error", Cause.isUnknownError(error) ? error.cause : error)),
-        Effect.as(false),
-      );
-    }),
-  );
-  if (started) yield* dive.jobs.push({ fn: "watch" }, WATCH_EVERY_MS);
-}).pipe(Effect.withSpan("Dive.begin"));
+    yield* markStarted(yield* Clock.currentTimeMillis);
+  }
+  const current = yield* diveState;
+  if (current._tag !== "Running") return; // ended (aborted) while setting up
+  const { runId } = current.input;
+  yield* Effect.tryPromise(() => harness.submit(PROMPT, { operationId: runId }));
+  yield* dive.jobs.push({ fn: "watch" }, WATCH_EVERY_MS);
+}).pipe(
+  Effect.catchCause((cause) => {
+    const error = Cause.squash(cause);
+    return Effect.logError("dive begin failed", cause).pipe(
+      Effect.andThen(endRun("error", Cause.isUnknownError(error) ? error.cause : error)),
+    );
+  }),
+  Effect.withSpan("Dive.begin"),
+);
 
 /** Every few seconds: end the run when the dive is done or over time; nudge a model that stopped early. */
 const watch = Effect.gen(function* () {
@@ -340,57 +396,76 @@ const watch = Effect.gen(function* () {
   const { input, startedAt } = current;
   const now = yield* Clock.currentTimeMillis;
   if (now - startedAt > RUN_WALL_MS) {
-    yield* finalize("deadline");
+    yield* endRun("deadline");
     return undefined;
   }
   // The task is the daily dive. Once the game holds all of today's results, the run
   // is over even if the model keeps going (one trial model moved on to Unlimited mode).
   const game = yield* todaysGame(input).pipe(Effect.orElseSucceed(Option.none));
   if (Option.exists(game, (g) => (g.results?.length ?? 0) >= input.prompts.length)) {
-    yield* finalize("complete");
+    yield* endRun("complete");
     return undefined;
   }
 
-  const pending = yield* Effect.orDie(Effect.tryPromise(() => harness.pending()));
+  const pending = yield* Effect.tryPromise(() => harness.pending());
   if (pending.length > 0) return { rescheduleAt: now + WATCH_EVERY_MS };
 
   // The model ended its turn before the dive is over: nudge it (same text, same cap,
   // for every model). Some models end a turn on a stray text message mid-game.
   const nudges = yield* state.nudges.get;
-  if (nudges < MAX_NUDGES) {
-    const operationId = operationOf(input.runId, nudges + 1);
-    yield* state.nudges.set(nudges + 1);
-    yield* Effect.orDie(Effect.tryPromise(() => harness.submit(NUDGE, { operationId })));
-    return { rescheduleAt: now + WATCH_EVERY_MS };
+  if (nudges >= MAX_NUDGES) {
+    yield* endRun("ended");
+    return undefined;
   }
-  yield* finalize("ended");
-  return undefined;
-}).pipe(Effect.withSpan("Dive.watch"));
+  // Count the nudge only once Pi has it: finalize waits on the last counted operation.
+  // A failed submit is retried next tick under the same operation id.
+  yield* Effect.tryPromise(() => harness.submit(NUDGE, { operationId: operationOf(input.runId, nudges + 1) }));
+  yield* state.nudges.set(nudges + 1);
+  return { rescheduleAt: now + WATCH_EVERY_MS };
+}).pipe(
+  // Pi unreachable for a tick: check again next tick (the wall clock still ends the run),
+  // instead of failing the job, which Lifecycle drops after its retries, leaving no watch.
+  Effect.catch((error) =>
+    logRecovered("dive watch check failed")(error).pipe(
+      Effect.andThen(Clock.currentTimeMillis),
+      Effect.map((now) => ({ rescheduleAt: now + WATCH_EVERY_MS })),
+    ),
+  ),
+  Effect.withSpan("Dive.watch"),
+);
+
+/** Finalize the run once. A job pushed without a recorded end (an older version's) records its own reason. */
+const finalizeJob = Effect.fn("Dive.finalizeJob")(function* (reason: FinalizeReason) {
+  yield* recordEnd(reason);
+  const current = yield* diveState;
+  if (current._tag === "Finalizing") yield* finalize(current);
+});
 
 const runJob = Match.type<Job>().pipe(
   Match.discriminatorsExhaustive("fn")({
     begin: () => Effect.as(begin, undefined),
     watch: () => watch,
-    finalize: ({ payload }) => Effect.as(finalize(payload), undefined),
+    finalize: ({ payload }) => Effect.as(finalizeJob(payload), undefined),
   }),
 );
 
 /** Idempotent: a second call for the same object is a no-op. Returns before the model runs. */
 const start = Effect.fn("Dive.start")(function* (input: RunInput) {
   const dive = yield* Dive;
-  if ((yield* diveState)._tag !== "New") return { accepted: false };
-  yield* dive.state.input.set(input);
+  // Check and store in one synchronous step, so two concurrent starts can't both accept.
+  const accepted = yield* Dive.useSync(({ state }) => {
+    if (decodeState(state)._tag !== "New") return false;
+    state.input.setUnsafe(input);
+    return true;
+  });
+  if (!accepted) return { accepted: false };
   dive.installTools(); // the vision flag is known now
   yield* dive.jobs.push({ fn: "begin" });
   return { accepted: true };
 });
 
-/** Coordinator deadline: stop the model and record what it has. */
-const abort = Effect.gen(function* () {
-  const { _tag } = yield* diveState;
-  if (_tag === "New" || _tag === "Finalized") return;
-  yield* (yield* Dive).jobs.push({ fn: "finalize", payload: "deadline" });
-}).pipe(Effect.withSpan("Dive.abort"));
+/** Coordinator deadline: stop the model and record what it has. Also requeues a finalize that stalled. */
+const abort = endRun("deadline").pipe(Effect.withSpan("Dive.abort"));
 
 const status = Effect.gen(function* () {
   const { state } = yield* Dive;
@@ -407,7 +482,6 @@ const status = Effect.gen(function* () {
  */
 export class DiveAgent extends DurableObject<Env> {
   readonly #state = runState(this.ctx.storage.kv);
-  readonly #writes = Effect.runSync(Scope.provide(FiberSet.make<void>(), Scope.makeUnsafe()));
 
   readonly ai = createAI({
     binding: gatewayBinding(this.env.AI, {
@@ -431,7 +505,6 @@ export class DiveAgent extends DurableObject<Env> {
 
   readonly harness = new PiHarness({
     harness: ({ storage, context, onWake }) => {
-      this.#installTools();
       const models = createModels();
       models.setProvider(this.#provider());
       return Harness.open(
@@ -464,7 +537,6 @@ export class DiveAgent extends DurableObject<Env> {
         page: this.page,
         ai: this.ai,
         jobs: this.#jobs,
-        writes: this.#writes,
         installTools: () => this.#installTools(),
       }),
     annotations: () => this.#logContext(),
@@ -472,6 +544,12 @@ export class DiveAgent extends DurableObject<Env> {
     jobs: this.#jobs,
     runJob,
   });
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    // Tools for the stored input (after an eviction); `start` reinstalls once the input arrives.
+    this.#installTools();
+  }
 
   /**
    * The Cloudflare provider, plus this run's model when Pi AI's Cloudflare catalog
@@ -520,16 +598,16 @@ export class DiveAgent extends DurableObject<Env> {
     );
   }
 
-  /** A captured submission for today's dive: written in the background, awaited at finalize. */
-  #record({ date, ...s }: CapturedSubmission): void {
+  /** A captured submission for today's dive. The page awaits it, so finalize's `page.close()` covers the write. */
+  #record({ date, ...s }: CapturedSubmission): Promise<void> {
     const input = Option.getOrUndefined(this.#state.input.getUnsafe());
-    if (!input || date !== input.day) return;
-    const write = Database.use((db) => db.insertSubmission({ ...s, runId: input.runId, day: input.day })).pipe(
-      Effect.catchTag("SqlError", (e) =>
-        logRecovered("submission write failed")(e).pipe(Effect.annotateLogs({ promptId: s.promptId })),
+    if (!input || date !== input.day) return Promise.resolve();
+    return this.#object.run(
+      Database.use((db) => db.insertSubmission({ ...s, runId: input.runId, day: input.day })).pipe(
+        Effect.catchCause((cause) => Effect.logError("submission write failed", cause)),
+        Effect.annotateLogs({ promptId: s.promptId }),
       ),
     );
-    void this.#object.run(FiberSet.run(this.#writes)(write));
   }
 
   start(input: RunInput): Promise<DiveStart> {

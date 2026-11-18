@@ -1,6 +1,7 @@
 import { D1Client } from "@effect/sql-d1";
 import { Array as Arr, Context, DateTime, Effect, Layer, Order, Schema, String as Str } from "effect";
 import { WorkerEnv } from "./Cloudflare";
+import { scorePrompt } from "./scoring";
 import {
   type BatchConfig,
   type Day,
@@ -121,6 +122,7 @@ const RunResultRow = Schema.Struct({
   attempts: Schema.Number,
 });
 const RunSubmissionRow = Schema.Struct({ runId: Schema.String, ...SubmissionResult.fields });
+const RunKeyRow = Schema.Struct({ runId: Schema.String, modelId: Schema.String, attempt: Schema.Number });
 
 /** Krillion's own share emojis (from the game bundle's TIERS / MISS_EMOJI). */
 const TIER_EMOJI: Readonly<Record<string, string>> = {
@@ -183,10 +185,14 @@ export class Database extends Context.Service<Database>()("krillion/Database", {
     const sql = yield* D1Client.D1Client;
     const now = Effect.map(DateTime.now, DateTime.formatIso);
     /** Malformed rows are a bug, not a recoverable error. */
+    const decodeRows =
+      <S extends Schema.Codec<any, any>>(schema: S) =>
+      (r: unknown): Effect.Effect<ReadonlyArray<S["Type"]>> =>
+        Effect.orDie(Schema.decodeUnknownEffect(Schema.Array(schema))(r));
     const rows =
       <S extends Schema.Codec<any, any>>(schema: S) =>
       <E>(query: Effect.Effect<ReadonlyArray<unknown>, E>): Effect.Effect<ReadonlyArray<S["Type"]>, E> =>
-        Effect.flatMap(query, (r) => Effect.orDie(Schema.decodeUnknownEffect(Schema.Array(schema))(r)));
+        Effect.flatMap(query, decodeRows(schema));
 
     /** Only moves a run that isn't terminal yet, so a late finalize can't overwrite a deadline. */
     const markRunStatusStatement = (runId: string, status: TerminalStatus, error: string | null, at: string) =>
@@ -194,9 +200,11 @@ export class Database extends Context.Service<Database>()("krillion/Database", {
         WHERE run_id = ${runId} AND status IN ('queued', 'running')`;
 
     // Uses the UNIQUE (batch, model_id, attempt) index.
-    const runsOfBatch = (batch: string) =>
+    const runsOfBatchStatement = (batch: string) =>
       sql`SELECT run_id, batch, day, model_id, attempt, trial, status, model_config, total_score, created_at
-        FROM runs WHERE batch = ${batch}`.pipe(rows(RunRow), Effect.withSpan("Database.runsOfBatch"));
+        FROM runs WHERE batch = ${batch}`;
+    const runsOfBatch = (batch: string) =>
+      runsOfBatchStatement(batch).pipe(rows(RunRow), Effect.withSpan("Database.runsOfBatch"));
 
     return {
       runsOfBatch,
@@ -214,29 +222,43 @@ export class Database extends Context.Service<Database>()("krillion/Database", {
         ]);
       }),
 
-      upsertModel: Effect.fn("Database.upsertModel")(function* (m: ModelEntry) {
-        yield* sql`INSERT INTO models (model_id, label, first_seen, last_config)
-          VALUES (${m.id}, ${m.label}, ${yield* now}, ${JSON.stringify(m)})
-          ON CONFLICT (model_id) DO UPDATE SET label = excluded.label, last_config = excluded.last_config`;
-      }),
-
-      /** False when (batch, model, attempt) already exists: dispatch is idempotent. */
-      insertRun: Effect.fn("Database.insertRun")(function* (r: {
-        readonly runId: string;
-        readonly batch: string;
-        readonly day: Day;
-        readonly model: ModelEntry;
-        readonly attempt: number;
-        readonly trial: boolean;
-        readonly promptVersion: string;
-      }) {
-        const inserted = yield* sql`INSERT INTO runs
-            (run_id, batch, day, model_id, attempt, trial, status, prompt_version, model_config, created_at)
-          VALUES (${r.runId}, ${r.batch}, ${r.day}, ${r.model.id}, ${r.attempt}, ${r.trial ? 1 : 0}, 'queued',
-            ${r.promptVersion}, ${JSON.stringify(r.model)}, ${yield* now})
-          ON CONFLICT (batch, model_id, attempt) DO NOTHING
-          RETURNING run_id`;
-        return inserted.length > 0;
+      /**
+       * Insert `queued` runs (and upsert their models) in one batch. Idempotent per (batch,
+       * model, attempt): returns each run with its id, the existing one when its row was
+       * already there, so concurrent or repeated launches agree on one id per agent.
+       */
+      insertRuns: Effect.fn("Database.insertRuns")(function* (
+        b: { readonly batch: string; readonly day: Day; readonly trial: boolean; readonly promptVersion: string },
+        runs: ReadonlyArray<{ readonly model: ModelEntry; readonly attempt: number }>,
+      ) {
+        if (runs.length === 0) return [];
+        const at = yield* now;
+        const models = new Map(runs.map(({ model }) => [model.id, model]));
+        const results = yield* sql.batch([
+          ...Array.from(
+            models.values(),
+            (m) => sql`INSERT INTO models (model_id, label, first_seen, last_config)
+              VALUES (${m.id}, ${m.label}, ${at}, ${JSON.stringify(m)})
+              ON CONFLICT (model_id) DO UPDATE SET label = excluded.label, last_config = excluded.last_config`,
+          ),
+          ...runs.map(
+            ({ model, attempt }) => sql`INSERT INTO runs
+                (run_id, batch, day, model_id, attempt, trial, status, prompt_version, model_config, created_at)
+              VALUES (${crypto.randomUUID()}, ${b.batch}, ${b.day}, ${model.id}, ${attempt}, ${b.trial ? 1 : 0}, 'queued',
+                ${b.promptVersion}, ${JSON.stringify(model)}, ${at})
+              ON CONFLICT (batch, model_id, attempt) DO NOTHING`,
+          ),
+          sql`SELECT run_id, model_id, attempt FROM runs WHERE batch = ${b.batch}`,
+        ]);
+        const key = (modelId: string, attempt: number) => `${modelId}|${attempt}`;
+        const ids = new Map((yield* decodeRows(RunKeyRow)(results.at(-1))).map((r) => [key(r.modelId, r.attempt), r.runId]));
+        const inserted: Array<{ readonly model: ModelEntry; readonly attempt: number; readonly runId: string }> = [];
+        for (const run of runs) {
+          const runId = ids.get(key(run.model.id, run.attempt));
+          if (runId === undefined) return yield* Effect.die(`run row missing after insert: ${key(run.model.id, run.attempt)}`);
+          inserted.push({ ...run, runId });
+        }
+        return inserted;
       }),
 
       markRunning: Effect.fn("Database.markRunning")(function* (runId: string, browserSessionId: string) {
@@ -295,18 +317,13 @@ export class Database extends Context.Service<Database>()("krillion/Database", {
         return ranked.length;
       }),
 
-      registerBatch: Effect.fn("Database.registerBatch")(function* (batch: string, c: BatchConfig) {
+      /** Idempotent. A batch's day, once known, is filled in: trials learn theirs at dispatch. */
+      registerBatch: Effect.fn("Database.registerBatch")(function* (batch: string, c: BatchConfig, day: Day | null) {
         yield* sql`INSERT INTO batches (batch, day, trial, models, created_by, created_at)
-          VALUES (${batch}, ${c.day}, ${c.trial ? 1 : 0}, ${c.models ? JSON.stringify(c.models) : null}, ${c.createdBy},
-            ${yield* now})
-          ON CONFLICT (batch) DO NOTHING`;
+          VALUES (${batch}, ${day}, ${c.trial ? 1 : 0}, ${c.models ? JSON.stringify(c.models) : null}, ${c.createdBy},
+            ${DateTime.formatIso(DateTime.makeUnsafe(c.createdAt))})
+          ON CONFLICT (batch) DO UPDATE SET day = COALESCE(batches.day, excluded.day)`;
       }),
-
-      setBatchDay: (batch: string, day: Day) =>
-        sql`UPDATE batches SET day = ${day} WHERE batch = ${batch} AND day IS NULL`.pipe(
-          Effect.asVoid,
-          Effect.withSpan("Database.setBatchDay"),
-        ),
 
       // Newest first via the batches_created index.
       recentBatches: (limit: number) =>
@@ -319,20 +336,33 @@ export class Database extends Context.Service<Database>()("krillion/Database", {
        * far: a prompt is accepted, missed (a later prompt has submissions), or pending.
        */
       liveDay: Effect.fn("Database.liveDay")(function* (day: Day) {
-        const games = yield* sql`SELECT day_number, status FROM games WHERE day = ${day}`.pipe(rows(LiveGameRow));
+        // One round trip. Results and submissions join through runs' (batch, …) index into the per-run primary keys.
+        const [games, prompts, batchRuns, results, subs] = yield* sql
+          .batch([
+            sql`SELECT day_number, status FROM games WHERE day = ${day}`,
+            sql`SELECT prompt_id, text FROM prompts WHERE day = ${day} ORDER BY position`,
+            runsOfBatchStatement(day),
+            sql`SELECT r.run_id, r.prompt_id, r.outcome, r.tier, r.answer, r.score, r.attempts
+              FROM runs x JOIN results r ON r.run_id = x.run_id WHERE x.batch = ${day}`,
+            sql`SELECT s.run_id, s.prompt_id, s.kind, s.canonical, s.tier, s.score, s.clock_ms
+              FROM runs x JOIN submissions s ON s.run_id = x.run_id
+              WHERE x.batch = ${day} AND x.status IN ('queued', 'running')
+              ORDER BY s.run_id, s.seq`,
+          ])
+          .pipe(
+            Effect.flatMap(([g, p, r, res, s]) =>
+              Effect.all([
+                decodeRows(LiveGameRow)(g),
+                decodeRows(PromptRow)(p),
+                decodeRows(RunRow)(r),
+                decodeRows(RunResultRow)(res),
+                decodeRows(RunSubmissionRow)(s),
+              ]),
+            ),
+          );
         const game = games[0];
         if (game === undefined) return null;
-        const prompts = yield* sql`SELECT prompt_id, text FROM prompts WHERE day = ${day} ORDER BY position`.pipe(
-          rows(PromptRow),
-        );
-        const runs = liveRuns(yield* runsOfBatch(day));
-        // Both join through runs' (batch, …) index into the per-run primary keys.
-        const results = yield* sql`SELECT r.run_id, r.prompt_id, r.outcome, r.tier, r.answer, r.score, r.attempts
-          FROM runs x JOIN results r ON r.run_id = x.run_id WHERE x.batch = ${day}`.pipe(rows(RunResultRow));
-        const subs = yield* sql`SELECT s.run_id, s.prompt_id, s.kind, s.canonical, s.tier, s.score, s.clock_ms
-          FROM runs x JOIN submissions s ON s.run_id = x.run_id
-          WHERE x.batch = ${day} AND x.status IN ('queued', 'running')
-          ORDER BY s.run_id, s.seq`.pipe(rows(RunSubmissionRow));
+        const runs = liveRuns(batchRuns);
         const resultsByRun = Arr.groupBy(results, (r) => r.runId);
         const subsByRun = Arr.groupBy(subs, (s) => s.runId);
 
@@ -344,29 +374,19 @@ export class Database extends Context.Service<Database>()("krillion/Database", {
             if (result !== undefined) {
               return { ...result, prompt: p.text, emoji: tierEmoji(result.outcome, result.tier) };
             }
-            const tries = mine.filter((s) => s.promptId === p.promptId);
-            const accepted = tries.find((s) => s.kind === "accepted");
-            if (accepted !== undefined) {
-              const tier = accepted.tier;
-              return {
-                prompt: p.text,
-                outcome: "accepted",
-                answer: accepted.canonical,
-                score: accepted.score ?? 0,
-                attempts: tries.length,
-                emoji: tierEmoji("accepted", tier),
-              };
-            }
-            const movedOn = prompts.slice(i + 1).some((q) => mine.some((s) => s.promptId === q.promptId));
+            const scored = scorePrompt(p.promptId, mine, false);
             // A finished run without result rows (its summary never got written) missed the rest.
-            const outcome = movedOn || isTerminal(run.status) ? (tries.length > 0 ? "timed_out" : "not_reached") : "pending";
+            const settled =
+              scored.outcome === "accepted" ||
+              isTerminal(run.status) ||
+              prompts.slice(i + 1).some((q) => mine.some((s) => s.promptId === q.promptId));
             return {
               prompt: p.text,
-              outcome,
-              answer: null,
-              score: 0,
-              attempts: tries.length,
-              emoji: outcome === "pending" ? PENDING_EMOJI : MISS_EMOJI,
+              outcome: settled ? scored.outcome : "pending",
+              answer: scored.answer,
+              score: scored.score,
+              attempts: scored.attempts,
+              emoji: settled ? tierEmoji(scored.outcome, scored.tier) : PENDING_EMOJI,
             };
           });
           return {
@@ -392,19 +412,22 @@ export class Database extends Context.Service<Database>()("krillion/Database", {
 
       /** Ranked results for real days since `since`: `daily_scores` by PK range, then each counted run's `results`. */
       leaderboard: Effect.fn("Database.leaderboard")(function* (since: Day) {
-        const scores = yield* sql`SELECT ds.day, ds.model_id, ds.run_id, ds.total_score, ds.rank, g.day_number, m.label
-          FROM daily_scores ds
-          JOIN games g ON g.day = ds.day
-          JOIN models m ON m.model_id = ds.model_id
-          WHERE ds.day >= ${since}`.pipe(rows(ScoreRow));
-        if (scores.length === 0) return [];
-        // Join through daily_scores rather than an IN list: D1 caps bound parameters at 100.
-        const results = yield* sql`SELECT r.run_id, r.tier, r.outcome, p.text, r.answer, r.score, r.attempts
-          FROM daily_scores ds
-          JOIN results r ON r.run_id = ds.run_id
-          JOIN prompts p ON p.day = r.day AND p.prompt_id = r.prompt_id
-          WHERE ds.day >= ${since}
-          ORDER BY r.run_id, p.position`.pipe(rows(ResultRow));
+        // One round trip. Results join through daily_scores rather than an IN list: D1 caps bound parameters at 100.
+        const [scores, results] = yield* sql
+          .batch([
+            sql`SELECT ds.day, ds.model_id, ds.run_id, ds.total_score, ds.rank, g.day_number, m.label
+              FROM daily_scores ds
+              JOIN games g ON g.day = ds.day
+              JOIN models m ON m.model_id = ds.model_id
+              WHERE ds.day >= ${since}`,
+            sql`SELECT r.run_id, r.tier, r.outcome, p.text, r.answer, r.score, r.attempts
+              FROM daily_scores ds
+              JOIN results r ON r.run_id = ds.run_id
+              JOIN prompts p ON p.day = r.day AND p.prompt_id = r.prompt_id
+              WHERE ds.day >= ${since}
+              ORDER BY r.run_id, p.position`,
+          ])
+          .pipe(Effect.flatMap(([s, r]) => Effect.all([decodeRows(ScoreRow)(s), decodeRows(ResultRow)(r)])));
         const byRun = Arr.groupBy(results, (r) => r.runId);
         return scores.map((r): LeaderboardEntry => {
           const prompts = byRun[r.runId] ?? [];
