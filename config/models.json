@@ -526,6 +526,18 @@
       "vision": true
     },
     {
+      "id": "openai/gpt-6.2-astra",
+      "label": "GPT-6.2 Astra",
+      "enabled": true,
+      "vision": true
+    },
+    {
+      "id": "openai/gpt-6.2-sol",
+      "label": "GPT-6.2 Sol",
+      "enabled": true,
+      "vision": true
+    },
+    {
       "id": "openai/o3",
       "label": "o3",
       "enabled": true,
