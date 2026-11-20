@@ -7,6 +7,7 @@ import { eastern } from "./domain";
 import { handler } from "./http/server";
 import { logRecovered } from "./Logging";
 import { Objects } from "./Objects";
+import { migrateRoster, migrationPath } from "./rosterMigration";
 
 export { DayCoordinator, DiveAgent, OpenAICredentials };
 
@@ -25,5 +26,5 @@ const startDailyBatch = Effect.fn("startDailyBatch")(function* (scheduledTime: n
 
 export default {
   scheduled: (controller, _env, ctx) => ctx.waitUntil(AppRuntime.runPromise(startDailyBatch(controller.scheduledTime))),
-  fetch: (request) => handler(request),
+  fetch: (request) => new URL(request.url).pathname === migrationPath ? migrateRoster(request) : handler(request),
 } satisfies ExportedHandler<Env>;
