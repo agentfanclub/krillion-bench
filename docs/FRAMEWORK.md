@@ -149,7 +149,7 @@ flowchart TB
   api --> d1
 ```
 
-- **One Worker, one D1, one pair of DO classes.** `DiveAgent` → `PlayAgent`, `DayCoordinator` → `BatchCoordinator` via wrangler `renamed_classes` (keeps existing transcripts). New DO names carry the game prefix; old Krillion objects keep their names and stay readable.
+- **One Worker, one D1, one pair of DO classes.** `DiveAgent` → `PlayAgent`, `DayCoordinator` → `BatchCoordinator` via `exports.durableObject({ state: "renamed", renamedTo })` tombstones in `cloudflare.config.ts`, shipped with `cf deploy` (keeps existing transcripts). New DO names carry the game prefix; old Krillion objects keep their names and stay readable.
 - **Per-game config in KV** `games` (admin-editable): `{ [gameId]: { enabled, models: "all" | ids[], schedule?: override } }`. The global `models` roster stays as is.
 - **Global launch limiter.** Today the 400 ms stagger is per coordinator; two games starting the same minute could exceed Browser Run's 3 launches/s. Smallest fix: the scheduler offsets each game's start (`at` minutes differ) and coordinators keep the stagger. A token-bucket DO only if that proves insufficient.
 

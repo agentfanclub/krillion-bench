@@ -95,7 +95,7 @@ Why PiHarness wins for *this* project:
 | Tool surface the model sees | Framework always adds a reserved `task` (subagent) tool, plus sandbox tools if a sandbox is set. Every model gets tools we didn't design | Exactly the tools we register |
 | Who owns the DO | Flue generates the class and owns `fetch`/`alarm`/`onRequest`; we customize through `extend({ base })` and must not override those | We own the class; `Lifecycle.use(browser).use(harness)` composes with `agents/browser` and Effect's DO-backed workflow engine without fighting a generator |
 | Browser Run | Nothing built in; `agents/browser` `Browser` is a Lifecycle capability, unclear fit with Flue's generated `Agent` subclass | First-class: `Browser` + `browserRun()` (guardrails, recording, Live View, reconnect after hibernation) |
-| Build | Vite plugin + `'use agent'` scan + generated `.flue-vite.wrangler.jsonc` | Plain `wrangler` |
+| Build | Vite plugin + `'use agent'` scan + generated `.flue-vite.wrangler.jsonc` | Plain `cf` (Wrangler bundler) |
 | Schemas | Valibot for tool input | Pi schema for tools; Effect Schema everywhere else (either way a second schema lib inside tool defs) |
 | Per-run model choice | `useModel()` per render, latched per submission; possible via `useDelivery().attributes` | `session.setModel(ai(spec))` before submit |
 | Maintainer | Third party, ~monthly releases | Cloudflare SDK; Pi pinned per SDK release |

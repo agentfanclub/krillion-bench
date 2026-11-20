@@ -2,9 +2,10 @@
   "compilerOptions": {
     "target": "es2023",
     "lib": ["es2023"],
-    "module": "es2022",
+    "module": "esnext",
     "moduleResolution": "bundler",
-    "types": ["./worker-configuration.d.ts"],
+    "allowImportingTsExtensions": true,
+    "types": ["./.cloudflare/types/index.d.ts"],
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": false,
@@ -13,5 +14,5 @@
     "isolatedModules": true,
     "verbatimModuleSyntax": true
   },
-  "include": ["src", "worker-configuration.d.ts"]
+  "include": ["src", "cloudflare.config.ts", ".cloudflare/types"]
 }
