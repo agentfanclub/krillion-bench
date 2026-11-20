@@ -6,11 +6,11 @@ import { Effect, Option, Predicate, Schema } from "effect";
 import type { App } from "../App";
 import { WorkerEnv } from "../Cloudflare";
 import { clip, logRecovered } from "../Logging";
+import { OPENAI_ROSTER_PREFIX, subscriptionModels } from "./openaiSubscription";
 
 /**
- * The AI binding as DiveAgent uses it: every model call goes through here, so this is
- * where provider failures are logged (with the gateway log id to look them up), and
- * where Gemini is made to work.
+ * The gateway transport logs provider failures with the gateway log id and
+ * adapts Gemini requests. The direct OpenAI route shares its response observer.
  *
  * Gemini through AI Gateway (`google-ai-studio`, BYOK key on the gateway):
  * `agents/models/pi-ai` routes only Anthropic/OpenAI wire formats to the gateway, so
@@ -48,8 +48,13 @@ const CATALOG_EXTRA: Readonly<Record<string, { base: string; vendorId: string; n
   "anthropic/claude-fable-5.2": { base: "claude-fable-5-1", vendorId: "claude-fable-5-2", name: "Claude Fable 5.2" },
 };
 
-/** The Pi model for a roster id: Gemini and catalog extras built here, everything else by `ai(id)`. */
-export function rosterModel(ai: AI, id: string): Model<Api> {
+/** Resolve a roster ID through the configured transport. */
+export function rosterModel(ai: AI, id: string, useSubscription = false): Model<Api> {
+  if (useSubscription && id.startsWith(OPENAI_ROSTER_PREFIX)) {
+    const model = subscriptionModels.find((model) => `${OPENAI_ROSTER_PREFIX}${model.id}` === id);
+    if (!model) throw new TypeError(`"${id}" is missing from Pi's OpenAI Responses catalog`);
+    return model;
+  }
   const extra = CATALOG_EXTRA[id];
   if (extra) {
     const base = Object.values(CLOUDFLARE_AI_GATEWAY_MODELS).find((m) => m.id === extra.base);
@@ -79,7 +84,7 @@ export function rosterModel(ai: AI, id: string): Model<Api> {
 /** One pickable model in the admin portal's "add model" list. */
 export const CatalogEntry = Schema.Struct({
   id: Schema.String,
-  source: Schema.Literals(["workers-ai", "ai-gateway"]),
+  source: Schema.Literals(["workers-ai", "ai-gateway", "chatgpt"]),
   description: Schema.String,
   functionCalling: Schema.Boolean,
   vision: Schema.Boolean,
@@ -90,10 +95,11 @@ export type CatalogEntry = typeof CatalogEntry.Type;
 
 /**
  * The admin portal's "add model" list: Workers AI text-generation models, plus the
- * Anthropic, OpenAI and Google models routed through the AI Gateway (BYOK keys on the gateway).
+ * Anthropic, OpenAI and Google models. OpenAI uses the ChatGPT plan when configured.
  */
 export const modelCatalog = Effect.gen(function* () {
   const env = yield* WorkerEnv;
+  const useSubscription = env.OPENAI_CHATGPT_CREDENTIAL !== undefined;
   const models = yield* Effect.promise(() => env.AI.models({ task: "Text Generation", per_page: 500 }));
   // Property values arrive as strings or JSON booleans depending on the property.
   const prop = (m: AiModelsSearchObject, id: string) => m.properties.find((p) => p.property_id === id)?.value;
@@ -120,10 +126,17 @@ export const modelCatalog = Effect.gen(function* () {
   });
   const gateway = createAI({ binding: env.AI, id: env.AI_GATEWAY })
     .provider.getModels()
-    .filter((m) => /^(anthropic|openai)\//.test(m.id))
+    .filter((m) => m.id.startsWith("anthropic/") || (!useSubscription && m.id.startsWith(OPENAI_ROSTER_PREFIX)))
     .map((m) => byok(m.id, m));
   const google = googleCatalog.map((m) => byok(`${GOOGLE_PREFIX}${m.id}`, m));
-  return [...workersAi, ...gateway, ...google].sort((a, b) => a.id.localeCompare(b.id));
+  const openai = useSubscription
+    ? subscriptionModels.map((m): CatalogEntry => ({
+        ...byok(`${OPENAI_ROSTER_PREFIX}${m.id}`, m),
+        source: "chatgpt",
+        description: `${m.name} · ChatGPT plan`,
+      }))
+    : [];
+  return [...workersAi, ...gateway, ...google, ...openai].sort((a, b) => a.id.localeCompare(b.id));
 });
 
 // ── Wire formats (only the fields touched here; everything else is preserved) ──
@@ -242,9 +255,11 @@ function providerMessage(error: unknown): string | undefined {
   return Option.isSome(wrapped) ? providerMessage(wrapped.value.error) : undefined;
 }
 
-/** Rate limits as OpenAI (`rate_limit_exceeded`), Anthropic (`rate_limit_error`) and Google (`RESOURCE_EXHAUSTED`) spell them. */
+/** Provider rate limits, including limits shared with the ChatGPT plan. */
 const isRateLimit = (error: unknown): boolean =>
-  /rate_limit|RESOURCE_EXHAUSTED/.test(Predicate.isString(error) ? error : (JSON.stringify(error) ?? ""));
+  /rate_limit|RESOURCE_EXHAUSTED|subscription_sharing_(?:workplace_individual_)?usage_limit_exceeded/.test(
+    Predicate.isString(error) ? error : (JSON.stringify(error) ?? ""),
+  );
 
 /** What the run wrapping the binding supplies. */
 export interface GatewayHooks {
@@ -260,18 +275,12 @@ export interface GatewayHooks {
 /** The AI binding also proxies AI Gateway over `fetch` (what `agents` uses); the type omits it. */
 type GatewayAi = Ai & { fetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response> };
 
-/**
- * The AI binding with every model call logged on failure and Gemini requests patched.
- *
- * Two paths reach a provider: `run` (Workers AI, and the gateway catalog's Anthropic and
- * OpenAI models, returning a raw `Response`) and `fetch` (provider-native gateway path:
- * Gemini and any other model object). Both are watched the same way.
- */
-export function gatewayBinding(ai: Ai, { run, onProviderError }: GatewayHooks): Ai {
-  const binding = ai as GatewayAi;
-  /** This run's signatures: a run only ever replays its own tool calls. */
-  const signatures: Signatures = new Map();
-
+function responseObserver(
+  { run, onProviderError }: GatewayHooks,
+  source: string,
+  signatures: Signatures,
+  gatewayLogId?: () => string | null,
+) {
   /**
    * Pass an SSE stream through line by line: log provider error events, and for Gemini
    * capture thought signatures and number tool calls.
@@ -295,7 +304,7 @@ export function gatewayBinding(ai: Ai, { run, onProviderError }: GatewayHooks): 
       if (error !== undefined) {
         const message = providerMessage(error);
         void run(
-          Effect.logError("ai gateway stream error event").pipe(
+          Effect.logError(`${source} stream error event`).pipe(
             Effect.annotateLogs({ ...fields, eventType: event.type, providerMessage: message, providerError: error }),
           ),
         );
@@ -341,7 +350,7 @@ export function gatewayBinding(ai: Ai, { run, onProviderError }: GatewayHooks): 
     const withResponse = {
       ...fields,
       status: response.status,
-      gatewayLogId: response.headers.get("cf-aig-log-id") ?? binding.aiGatewayLogId ?? undefined,
+      gatewayLogId: response.headers.get("cf-aig-log-id") ?? gatewayLogId?.() ?? undefined,
     };
     if (!response.ok) {
       const text = yield* Effect.promise(() =>
@@ -351,7 +360,7 @@ export function gatewayBinding(ai: Ai, { run, onProviderError }: GatewayHooks): 
           .catch((e: unknown) => `<unreadable body: ${String(e)}>`),
       );
       const message = providerMessage(Option.getOrUndefined(decodeJson(text))) ?? `HTTP ${response.status}: ${clip(text, 300)}`;
-      yield* Effect.logError("ai gateway request failed").pipe(
+      yield* Effect.logError(`${source} request failed`).pipe(
         Effect.annotateLogs({
           status: response.status,
           gatewayLogId: withResponse.gatewayLogId,
@@ -366,6 +375,28 @@ export function gatewayBinding(ai: Ai, { run, onProviderError }: GatewayHooks): 
     if (!response.body || !response.headers.get("content-type")?.includes("text/event-stream")) return response;
     return new Response(watchStream(response.body, gemini, withResponse), response);
   });
+  return inspect;
+}
+
+/** Observe direct OpenAI responses the same way as gateway responses. */
+export function subscriptionFetch(hooks: GatewayHooks): typeof fetch {
+  const inspect = responseObserver(hooks, "openai subscription", new Map());
+  return async (input, init) => {
+    const response = await fetch(input, init);
+    return hooks.run(inspect(response, { provider: "openai", path: "subscription" }, false));
+  };
+}
+
+/**
+ * The AI binding with every model call logged on failure and Gemini requests patched.
+ * Catalog and Workers AI requests use `run`. Provider-native gateway requests use `fetch`.
+ */
+export function gatewayBinding(ai: Ai, hooks: GatewayHooks): Ai {
+  const binding = ai as GatewayAi;
+  const { run, onProviderError } = hooks;
+  /** This run's signatures: a run only ever replays its own tool calls. */
+  const signatures: Signatures = new Map();
+  const inspect = responseObserver(hooks, "ai gateway", signatures, () => binding.aiGatewayLogId);
 
   const fetchLogged = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = Predicate.isString(input) ? input : input instanceof URL ? input.href : input.url;

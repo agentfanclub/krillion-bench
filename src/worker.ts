@@ -1,5 +1,6 @@
 import { DateTime, Effect } from "effect";
 import { DiveAgent } from "./agent/DiveAgent";
+import { OpenAICredentials } from "./agent/OpenAICredentials";
 import { AppRuntime } from "./App";
 import { DayCoordinator } from "./coordinator";
 import { eastern } from "./domain";
@@ -7,7 +8,7 @@ import { handler } from "./http/server";
 import { logRecovered } from "./Logging";
 import { Objects } from "./Objects";
 
-export { DayCoordinator, DiveAgent };
+export { DayCoordinator, DiveAgent, OpenAICredentials };
 
 /** Fires at 04:05 and 05:05 UTC; exactly one of them is 00:05 in New York. A real day's batch is named by the day. */
 const startDailyBatch = Effect.fn("startDailyBatch")(function* (scheduledTime: number) {

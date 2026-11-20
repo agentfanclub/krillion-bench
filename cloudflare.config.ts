@@ -10,6 +10,7 @@ const self = defineWorker({
 	exports: {
 		DiveAgent: exports.durableObject({ storage: "sqlite" }),
 		DayCoordinator: exports.durableObject({ storage: "sqlite" }),
+		OpenAICredentials: exports.durableObject({ storage: "sqlite" }),
 	},
 });
 
@@ -80,6 +81,7 @@ export default defineConfig({
 			}),
 			DIVE_AGENT: bindings.durableObject<typeof self, "DiveAgent">({ worker: self, exportName: "DiveAgent" }),
 			DAY_COORDINATOR: bindings.durableObject<typeof self, "DayCoordinator">({ worker: self, exportName: "DayCoordinator" }),
+			OPENAI_CREDENTIALS: bindings.durableObject<typeof self, "OpenAICredentials">({ worker: self, exportName: "OpenAICredentials" }),
 			AI: bindings.ai({}),
 			BROWSER: bindings.browser({}),
 			ASSETS: bindings.assets(),

@@ -118,7 +118,30 @@ Excluded, not chat LLMs: `@cf/meta/llama-guard-3-8b` (safety classifier), `@cf/c
 
 **Deprecation cliff:** 16 Workers AI models are scheduled for removal on **2026-11-20** (kimi-k2.6, kimi-k2.7-code, glm-5.3-flash, glm-5.2, deepseek-v4-flash/pro, nemotron-3-120b, qwen3-30b, qwq-32b, deepseek-r1-distill-qwen-32b, llama-3.1-8b-fp8, llama-3.2-1b/3b, gemma-2b/7b lora, llama-2-7b lora). They are disabled in the roster since 2026-11-10 (kept in KV, so they can be re-enabled until removal); the `models` table keeps their history.
 
-Third-party models need no structural change: Pi AI's gateway catalog has Anthropic (`anthropic-messages`) and OpenAI (`openai-responses`) routed natively; Gemini goes through the compat route in §0. All use BYOK keys on the gateway.
+The BYOK gateway routes use Anthropic Messages and OpenAI Responses natively. Gemini uses the compatibility route in §0.
+
+#### OpenAI on a ChatGPT plan
+
+The optional `OPENAI_CHATGPT_CREDENTIAL` Worker secret sends `openai/*` roster entries directly to OpenAI through Pi's native Responses provider. With the secret unset, those entries use the gateway. The model IDs and benchmark tools stay the same. Subscription runs report tokens and leave the dollar cost unset. Model availability and usage limits depend on the connected account.
+
+After deploying the Worker and its Durable Object migration, run the sign-in command from the machine where you want the credential file. It works over SSH.
+
+```sh
+node scripts/openai-subscription.mjs .wrangler/openai-chatgpt.json
+```
+
+Open the URL it prints in your own browser and approve plan usage for Krillion Bench. If the browser cannot reach `127.0.0.1` after sign-in, copy the **full URL** from its address bar and paste it into the waiting terminal. The script receives the callback automatically when the browser is on the same machine.
+
+Upload the private output file once the command succeeds.
+
+```sh
+bunx cf workers secrets update OPENAI_CHATGPT_CREDENTIAL --worker krillion-bench --text "$(cat .wrangler/openai-chatgpt.json)" &&
+  rm .wrangler/openai-chatgpt.json
+```
+
+The login command checks which enabled OpenAI entries in `config/models.json` are listed for the account. Check the deployed roster in the admin portal if it differs from that file. After the import, try a single OpenAI run from the admin portal.
+
+One `OpenAICredentials` Durable Object owns refreshes and persists the rotated credential. Use a dedicated sign-in for this Worker so another Pi session does not refresh the same credential. To reconnect, repeat the command with a fresh sign-in and replace the secret. To return to gateway billing for new runs, delete the Worker secret. To revoke the grant, disconnect Krillion Bench under **Settings → Security and login → Sign in with ChatGPT**. OpenAI documents this flow for local apps and self-hosted VMs and provides an interest form for remotely hosted apps. [OpenAI hosting guidance](https://developers.openai.com/siwc/token-sharing-open-source)
 
 ## 3. Daily flow
 
