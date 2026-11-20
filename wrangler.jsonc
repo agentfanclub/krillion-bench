@@ -46,8 +46,12 @@
   "durable_objects": {
     "bindings": [
       { "name": "DIVE_AGENT", "class_name": "DiveAgent" },
-      { "name": "DAY_COORDINATOR", "class_name": "DayCoordinator" }
+      { "name": "DAY_COORDINATOR", "class_name": "DayCoordinator" },
+      { "name": "OPENAI_CREDENTIALS", "class_name": "OpenAICredentials" }
     ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["DiveAgent", "DayCoordinator"] }]
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["DiveAgent", "DayCoordinator"] },
+    { "tag": "v2", "new_sqlite_classes": ["OpenAICredentials"] }
+  ]
 }

@@ -5,7 +5,7 @@ import { createRegistry, type EntryRecord, Harness } from "@earendil-works/pi-du
 import { Browser, browserRun } from "agents/browser";
 import { PiHarness, type PiOperationResult } from "agents/harness/pi";
 import { Lifecycle, type LifecycleJobContext, type LifecycleJobOutcome } from "agents/lifecycle";
-import { type AI, createAI } from "agents/models/pi-ai";
+import { createAI } from "agents/models/pi-ai";
 import { DurableObject } from "cloudflare:workers";
 import { Cause, Clock, Context, type Data, Effect, Match, Option, Schema } from "effect";
 import { durableObjectRunner } from "../App";
@@ -15,7 +15,8 @@ import { type PromptResult, RunInput, type RunSummary, type TerminalStatus } fro
 import { clip, logRecovered } from "../Logging";
 import { type AgentStatus, type DiveStart, DivePhase, Objects } from "../Objects";
 import { type CapturedSubmission, type GameState, RunPage } from "./browser";
-import { gatewayBinding, rosterModel } from "./gateway";
+import { gatewayBinding, type GatewayHooks, rosterModel, subscriptionFetch } from "./gateway";
+import { OPENAI_ROSTER_PREFIX, subscriptionProvider } from "./openaiSubscription";
 import { NUDGE, PROMPT } from "./prompt";
 import { browserExtension } from "./tools";
 import { scorePrompt } from "../scoring";
@@ -50,6 +51,7 @@ const runState = (kv: SyncKvStorage) => ({
   providerError: stored(kv, "run:lastProviderError", Schema.String),
   /** Set once any provider call of this run was rate limited. */
   rateLimited: stored(kv, "run:rateLimited", Schema.Boolean, false),
+  providerAuthFailed: stored(kv, "run:providerAuthFailed", Schema.Boolean, false),
   /** Why the run ended, recorded once before finalize starts; the first reason wins. */
   finalizeReason: stored(kv, "run:finalizeReason", FinalizeReason),
   /** Our own error that ended the run (a failed begin). */
@@ -65,7 +67,7 @@ class Dive extends Context.Service<
     readonly harness: PiHarness;
     readonly browser: Browser;
     readonly page: RunPage;
-    readonly ai: AI;
+    readonly modelFor: (id: string) => Model<Api>;
     readonly jobs: JobQueue<Job>;
     /** (Re)install the browser tools: the vision flag comes from the stored input. */
     readonly installTools: () => void;
@@ -189,14 +191,14 @@ const isPiBreakdown = Schema.is(Schema.Literals(["model_error", "no_model", "int
 /**
  * Model failures are results; failures on our side, the provider's, or the
  * site's are `infra_error` (and get one retry from the coordinator). A run that died
- * on a model error after being rate limited is the provider's limit, not the model's
- * failure, so it is infra too, however far it got.
+ * on a model error after a rate limit or credential failure is infra too,
+ * however far it got.
  */
 const classify = (
   reason: FinalizeReason,
   outcome: PiOperationResult | undefined,
   submissions: number,
-  rateLimited: boolean,
+  providerUnavailable: boolean,
 ): TerminalStatus =>
   Match.value(reason).pipe(
     Match.withReturnType<TerminalStatus>(),
@@ -205,7 +207,7 @@ const classify = (
     Match.when("error", () => "infra_error"),
     Match.when("ended", () => {
       if (outcome?.status === "done" || outcome?.reason === "turn_limit") return "completed";
-      if (outcome?.reason === "model_error" && rateLimited) return "infra_error";
+      if (outcome?.reason === "model_error" && providerUnavailable) return "infra_error";
       if (isPiBreakdown(outcome?.reason)) return submissions === 0 ? "infra_error" : "failed";
       return "failed";
     }),
@@ -299,8 +301,10 @@ const finalize = Effect.fn("Dive.finalize")(function* ({
 
   const piOutcome = outcome ? (outcome.reason ? `${outcome.status}:${outcome.reason}` : outcome.status) : "unknown";
   const rateLimited = yield* state.rateLimited.get;
+  const providerAuthFailed = yield* state.providerAuthFailed.get;
   const providerError = Option.getOrUndefined(yield* state.providerError.get);
-  const status = classify(reason, outcome, subs.length, rateLimited);
+  const status = classify(reason, outcome, subs.length, rateLimited || providerAuthFailed);
+  const costUsd = Object.keys(usage?.models ?? {}).some((id) => id.startsWith(OPENAI_ROSTER_PREFIX)) ? null : tokens.cost;
   const summary: RunSummary = {
     runId: input.runId,
     day: input.day,
@@ -311,7 +315,7 @@ const finalize = Effect.fn("Dive.finalize")(function* ({
     steps: yield* state.steps.get,
     inputTokens: tokens.input,
     outputTokens: tokens.output,
-    costUsd: tokens.cost,
+    costUsd,
     piOutcome,
     selfReport: outcome?.text ?? null,
     results,
@@ -331,7 +335,7 @@ const finalize = Effect.fn("Dive.finalize")(function* ({
       runError: summary.error ?? undefined,
       inputTokens: tokens.input,
       outputTokens: tokens.output,
-      costUsd: tokens.cost,
+      costUsd,
     }),
   );
   yield* db.writeRunSummary(summary).pipe(
@@ -363,7 +367,7 @@ const begin = Effect.gen(function* () {
     const { input } = accepted;
     yield* Effect.tryPromise(() => dive.page.page()); // open the browser before the model's clock starts
     yield* (yield* Database).markRunning(input.runId, yield* Effect.tryPromise(() => dive.page.sessionId()));
-    yield* Effect.tryPromise(() => harness.session().setModel(rosterModel(dive.ai, input.model.id)));
+    yield* Effect.tryPromise(() => harness.session().setModel(dive.modelFor(input.model.id)));
     const thinkingLevel = input.model.thinkingLevel;
     if (thinkingLevel) {
       yield* Effect.tryPromise(async () => {
@@ -483,14 +487,16 @@ const status = Effect.gen(function* () {
 export class DiveAgent extends DurableObject<Env> {
   readonly #state = runState(this.ctx.storage.kv);
 
+  readonly #useSubscription = this.env.OPENAI_CHATGPT_CREDENTIAL !== undefined;
+  readonly #providerHooks: GatewayHooks = {
+    run: (effect) => this.#object.run(effect),
+    onProviderError: (message, rateLimited) => {
+      this.#state.providerError.setUnsafe(clip(message, 1_000));
+      if (rateLimited) this.#state.rateLimited.setUnsafe(true);
+    },
+  };
   readonly ai = createAI({
-    binding: gatewayBinding(this.env.AI, {
-      run: (effect) => this.#object.run(effect),
-      onProviderError: (message, rateLimited) => {
-        this.#state.providerError.setUnsafe(clip(message, 1_000));
-        if (rateLimited) this.#state.rateLimited.setUnsafe(true);
-      },
-    }),
+    binding: gatewayBinding(this.env.AI, this.#providerHooks),
     id: this.env.AI_GATEWAY,
   });
   readonly browser = new Browser({
@@ -507,6 +513,11 @@ export class DiveAgent extends DurableObject<Env> {
     harness: ({ storage, context, onWake }) => {
       const models = createModels();
       models.setProvider(this.#provider());
+      // Also register this when disabled so a resumed subscription run reports an auth error.
+      models.setProvider(subscriptionProvider(this.env, subscriptionFetch(this.#providerHooks), (message) => {
+        this.#state.providerError.setUnsafe(clip(message, 1_000));
+        this.#state.providerAuthFailed.setUnsafe(true);
+      }));
       return Harness.open(
         storage,
         {
@@ -535,7 +546,7 @@ export class DiveAgent extends DurableObject<Env> {
         harness: this.harness,
         browser: this.browser,
         page: this.page,
-        ai: this.ai,
+        modelFor: (id) => rosterModel(this.ai, id, this.#useSubscription),
         jobs: this.#jobs,
         installTools: () => this.#installTools(),
       }),
@@ -563,6 +574,9 @@ export class DiveAgent extends DurableObject<Env> {
       Option.match(this.#state.input.getUnsafe(), {
         onNone: () => [],
         onSome: (input) => {
+          // Existing gateway models are already in the catalog. Subscription-only models
+          // belong to the native provider and need no gateway registration.
+          if (this.#useSubscription && input.model.id.startsWith(OPENAI_ROSTER_PREFIX)) return [];
           const model = rosterModel(this.ai, input.model.id);
           return base.getModels().some((m) => m.id === model.id) ? [] : [model];
         },

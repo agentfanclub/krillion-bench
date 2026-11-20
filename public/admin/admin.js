@@ -68,7 +68,7 @@ function renderCatalog() {
     .filter(c => !have.has(c.id))
     .sort((a, b) => Number(b.functionCalling) - Number(a.functionCalling) || a.id.localeCompare(b.id))
     .map(c => {
-      const notes = [c.source === 'ai-gateway' && 'AI Gateway, BYOK', c.functionCalling ? 'tools' : 'no tools',
+      const notes = [c.source === 'ai-gateway' && 'AI Gateway, BYOK', c.source === 'chatgpt' && 'ChatGPT plan', c.functionCalling ? 'tools' : 'no tools',
         c.vision && 'vision', c.reasoning && 'reasoning', c.deprecates && `deprecates ${c.deprecates}`].filter(Boolean).join(', ');
       return el('option', { value: c.id, textContent: `${c.id} (${notes})` });
     });
