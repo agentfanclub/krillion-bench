@@ -7,10 +7,11 @@ import type { App } from "../App";
 import { WorkerEnv } from "../Cloudflare";
 import { clip, logRecovered } from "../Logging";
 import { OPENAI_ROSTER_PREFIX, subscriptionModels } from "./openaiSubscription";
+import { ANTHROPIC_ROSTER_PREFIX, anthropicRosterId, anthropicSubscriptionModels } from "./anthropicSubscription";
 
 /**
  * The gateway transport logs provider failures with the gateway log id and
- * adapts Gemini requests. The direct OpenAI route shares its response observer.
+ * adapts Gemini requests. Direct subscription routes share its response observer.
  *
  * Gemini through AI Gateway (`google-ai-studio`, BYOK key on the gateway):
  * `agents/models/pi-ai` routes only Anthropic/OpenAI wire formats to the gateway, so
@@ -49,7 +50,13 @@ const CATALOG_EXTRA: Readonly<Record<string, { base: string; vendorId: string; n
 };
 
 /** Resolve a roster ID through the configured transport. */
-export function rosterModel(ai: AI, id: string, useSubscription = false): Model<Api> {
+export function rosterModel(ai: AI, id: string, useSubscription = false, useClaudeSubscription = false): Model<Api> {
+  if (useClaudeSubscription && id.startsWith(ANTHROPIC_ROSTER_PREFIX)) {
+    const vendorId = id.slice(ANTHROPIC_ROSTER_PREFIX.length).replaceAll(".", "-");
+    const model = anthropicSubscriptionModels.find((model) => model.id === vendorId);
+    if (!model) throw new TypeError(`"${id}" is missing from Pi's Anthropic catalog`);
+    return model;
+  }
   if (useSubscription && id.startsWith(OPENAI_ROSTER_PREFIX)) {
     const model = subscriptionModels.find((model) => `${OPENAI_ROSTER_PREFIX}${model.id}` === id);
     if (!model) throw new TypeError(`"${id}" is missing from Pi's OpenAI Responses catalog`);
@@ -84,7 +91,7 @@ export function rosterModel(ai: AI, id: string, useSubscription = false): Model<
 /** One pickable model in the admin portal's "add model" list. */
 export const CatalogEntry = Schema.Struct({
   id: Schema.String,
-  source: Schema.Literals(["workers-ai", "ai-gateway", "chatgpt"]),
+  source: Schema.Literals(["workers-ai", "ai-gateway", "chatgpt", "claude"]),
   description: Schema.String,
   functionCalling: Schema.Boolean,
   vision: Schema.Boolean,
@@ -95,11 +102,12 @@ export type CatalogEntry = typeof CatalogEntry.Type;
 
 /**
  * The admin portal's "add model" list: Workers AI text-generation models, plus the
- * Anthropic, OpenAI and Google models. OpenAI uses the ChatGPT plan when configured.
+ * Anthropic, OpenAI and Google models. Claude and ChatGPT use subscriptions when configured.
  */
 export const modelCatalog = Effect.gen(function* () {
   const env = yield* WorkerEnv;
   const useSubscription = env.OPENAI_CHATGPT_CREDENTIAL !== undefined;
+  const useClaudeSubscription = env.CLAUDE_CODE_OAUTH_TOKEN !== undefined;
   const models = yield* Effect.promise(() => env.AI.models({ task: "Text Generation", per_page: 500 }));
   // Property values arrive as strings or JSON booleans depending on the property.
   const prop = (m: AiModelsSearchObject, id: string) => m.properties.find((p) => p.property_id === id)?.value;
@@ -126,7 +134,7 @@ export const modelCatalog = Effect.gen(function* () {
   });
   const gateway = createAI({ binding: env.AI, id: env.AI_GATEWAY })
     .provider.getModels()
-    .filter((m) => m.id.startsWith("anthropic/") || (!useSubscription && m.id.startsWith(OPENAI_ROSTER_PREFIX)))
+    .filter((m) => (!useClaudeSubscription && m.id.startsWith(ANTHROPIC_ROSTER_PREFIX)) || (!useSubscription && m.id.startsWith(OPENAI_ROSTER_PREFIX)))
     .map((m) => byok(m.id, m));
   const google = googleCatalog.map((m) => byok(`${GOOGLE_PREFIX}${m.id}`, m));
   const openai = useSubscription
@@ -136,7 +144,14 @@ export const modelCatalog = Effect.gen(function* () {
         description: `${m.name} · ChatGPT plan`,
       }))
     : [];
-  return [...workersAi, ...gateway, ...google, ...openai].sort((a, b) => a.id.localeCompare(b.id));
+  const claude = useClaudeSubscription
+    ? anthropicSubscriptionModels.map((m): CatalogEntry => ({
+        ...byok(anthropicRosterId(m.id), m),
+        source: "claude",
+        description: `${m.name} · Claude plan`,
+      }))
+    : [];
+  return [...workersAi, ...gateway, ...google, ...openai, ...claude].sort((a, b) => a.id.localeCompare(b.id));
 });
 
 // ── Wire formats (only the fields touched here; everything else is preserved) ──
@@ -378,12 +393,15 @@ function responseObserver(
   return inspect;
 }
 
-/** Observe direct OpenAI responses the same way as gateway responses. */
-export function subscriptionFetch(hooks: GatewayHooks): typeof fetch {
-  const inspect = responseObserver(hooks, "openai subscription", new Map());
+/** Observe direct subscription responses the same way as gateway responses. */
+export function subscriptionFetch(hooks: GatewayHooks, provider = "openai", onAuthError?: (message: string) => void): typeof fetch {
+  const inspect = responseObserver(hooks, `${provider} subscription`, new Map());
   return async (input, init) => {
     const response = await fetch(input, init);
-    return hooks.run(inspect(response, { provider: "openai", path: "subscription" }, false));
+    if (response.status === 401 || response.status === 403) {
+      onAuthError?.(`HTTP ${response.status}: ${provider} subscription authentication failed. Replace the subscription credential if expired or revoked.`);
+    }
+    return hooks.run(inspect(response, { provider, path: "subscription" }, false));
   };
 }
 

@@ -143,6 +143,32 @@ The login command checks which enabled OpenAI entries in `config/models.json` ar
 
 One `OpenAICredentials` Durable Object owns refreshes and persists the rotated credential. Use a dedicated sign-in for this Worker so another Pi session does not refresh the same credential. To reconnect, repeat the command with a fresh sign-in and replace the secret. To return to gateway billing for new runs, delete the Worker secret. To revoke the grant, disconnect Krillion Bench under **Settings → Security and login → Sign in with ChatGPT**. OpenAI documents this flow for local apps and self-hosted VMs and provides an interest form for remotely hosted apps. [OpenAI hosting guidance](https://developers.openai.com/siwc/token-sharing-open-source)
 
+#### Claude on a subscription
+
+With Anthropic permission for this benchmark's use of subscription credentials, the optional `CLAUDE_CODE_OAUTH_TOKEN` Worker secret sends `anthropic/*` roster entries directly through Pi's native Anthropic Messages provider. Without the secret, new runs use the existing BYOK gateway route. Roster IDs stay the same; dotted versions such as `anthropic/claude-opus-4.8` map to native IDs such as `claude-opus-4-8`.
+
+Generate a long-lived access token on your own machine:
+
+```sh
+claude setup-token
+```
+
+Then run the following command and paste only the generated token at Wrangler's secret prompt:
+
+```sh
+bunx wrangler secret put CLAUDE_CODE_OAUTH_TOKEN
+```
+
+Deploy the implementation with `bun run deploy`, then try a single Claude run from the admin portal. No new Durable Object or migration is needed. Pi recognizes the `sk-ant-oat...` token and supplies Bearer authentication, Claude Code headers, and its Claude Code system prompt. The benchmark tools remain installed through Pi.
+
+This is a static access token, not a refresh credential. The Worker does not renew it. Generate a new token and replace the secret when it expires or is revoked. [Claude's setup-token documentation](https://code.claude.com/docs/en/authentication#generate-a-long-lived-token) describes its lifetime. Missing or invalid credentials and HTTP 401/403 responses are recorded as authentication failures, without silently switching to paid API requests. Subscription runs retain token counts and leave dollar cost unset; account model access and shared subscription limits still apply.
+
+To return new runs to gateway billing:
+
+```sh
+bunx wrangler secret delete CLAUDE_CODE_OAUTH_TOKEN
+```
+
 ## 3. Daily flow
 
 1. **Cron** `5 4 * * *` and `5 5 * * *` (UTC). The handler computes the New York date/hour with `Intl.DateTimeFormat`; proceeds only when the hour is 0 (exactly one of the two firings matches, DST-proof). Calls `DAY_COORDINATOR.getByName(etDate).start(...)` (idempotent).

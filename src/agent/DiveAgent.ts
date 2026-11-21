@@ -17,6 +17,7 @@ import { type AgentStatus, type DiveStart, DivePhase, Objects } from "../Objects
 import { type CapturedSubmission, type GameState, RunPage } from "./browser";
 import { gatewayBinding, type GatewayHooks, rosterModel, subscriptionFetch } from "./gateway";
 import { OPENAI_ROSTER_PREFIX, subscriptionProvider } from "./openaiSubscription";
+import { ANTHROPIC_ROSTER_PREFIX, anthropicSubscriptionProvider } from "./anthropicSubscription";
 import { NUDGE, PROMPT } from "./prompt";
 import { browserExtension } from "./tools";
 import { scorePrompt } from "../scoring";
@@ -304,7 +305,9 @@ const finalize = Effect.fn("Dive.finalize")(function* ({
   const providerAuthFailed = yield* state.providerAuthFailed.get;
   const providerError = Option.getOrUndefined(yield* state.providerError.get);
   const status = classify(reason, outcome, subs.length, rateLimited || providerAuthFailed);
-  const costUsd = Object.keys(usage?.models ?? {}).some((id) => id.startsWith(OPENAI_ROSTER_PREFIX)) ? null : tokens.cost;
+  const costUsd = Object.keys(usage?.models ?? {}).some((id) =>
+    id.startsWith(OPENAI_ROSTER_PREFIX) || id.startsWith(ANTHROPIC_ROSTER_PREFIX),
+  ) ? null : tokens.cost;
   const summary: RunSummary = {
     runId: input.runId,
     day: input.day,
@@ -488,6 +491,7 @@ export class DiveAgent extends DurableObject<Env> {
   readonly #state = runState(this.ctx.storage.kv);
 
   readonly #useSubscription = this.env.OPENAI_CHATGPT_CREDENTIAL !== undefined;
+  readonly #useClaudeSubscription = this.env.CLAUDE_CODE_OAUTH_TOKEN !== undefined;
   readonly #providerHooks: GatewayHooks = {
     run: (effect) => this.#object.run(effect),
     onProviderError: (message, rateLimited) => {
@@ -518,6 +522,15 @@ export class DiveAgent extends DurableObject<Env> {
         this.#state.providerError.setUnsafe(clip(message, 1_000));
         this.#state.providerAuthFailed.setUnsafe(true);
       }));
+      const claudeAuthError = (message: string) => {
+        this.#state.providerError.setUnsafe(clip(message, 1_000));
+        this.#state.providerAuthFailed.setUnsafe(true);
+      };
+      models.setProvider(anthropicSubscriptionProvider(
+        this.env,
+        subscriptionFetch(this.#providerHooks, "anthropic", claudeAuthError),
+        claudeAuthError,
+      ));
       return Harness.open(
         storage,
         {
@@ -546,7 +559,7 @@ export class DiveAgent extends DurableObject<Env> {
         harness: this.harness,
         browser: this.browser,
         page: this.page,
-        modelFor: (id) => rosterModel(this.ai, id, this.#useSubscription),
+        modelFor: (id) => rosterModel(this.ai, id, this.#useSubscription, this.#useClaudeSubscription),
         jobs: this.#jobs,
         installTools: () => this.#installTools(),
       }),
@@ -577,6 +590,7 @@ export class DiveAgent extends DurableObject<Env> {
           // Existing gateway models are already in the catalog. Subscription-only models
           // belong to the native provider and need no gateway registration.
           if (this.#useSubscription && input.model.id.startsWith(OPENAI_ROSTER_PREFIX)) return [];
+          if (this.#useClaudeSubscription && input.model.id.startsWith(ANTHROPIC_ROSTER_PREFIX)) return [];
           const model = rosterModel(this.ai, input.model.id);
           return base.getModels().some((m) => m.id === model.id) ? [] : [model];
         },
