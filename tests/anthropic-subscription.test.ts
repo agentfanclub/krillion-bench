@@ -30,14 +30,14 @@ describe("Claude subscription", () => {
     }
   });
 
-  test("setup-token selects Bearer authentication and streams tool calls through Pi", async () => {
+  test.each(["claude-sonnet-4-6", "claude-mythos-5-1", "claude-mythos-5-2"])("%s resolves in Pi and streams subscription tool calls", async (modelId) => {
     let request: { headers: Headers; body: any } | undefined;
     const fetchResponses = (async (input, init) => {
       const req = new Request(input, init);
       request = { headers: req.headers, body: await req.json() };
       expect(`${new URL(req.url).origin}${new URL(req.url).pathname}`).toBe("https://api.anthropic.com/v1/messages");
       const events = [
-        { type: "message_start", message: { id: "msg_test", type: "message", role: "assistant", content: [], model: "claude-sonnet-4-6", usage: { input_tokens: 10, output_tokens: 0 } } },
+        { type: "message_start", message: { id: "msg_test", type: "message", role: "assistant", content: [], model: modelId, usage: { input_tokens: 10, output_tokens: 0 } } },
         { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "tool_test", name: "benchmark_action", input: {} } },
         { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '{"action":"play"}' } },
         { type: "content_block_stop", index: 0 },
@@ -50,7 +50,8 @@ describe("Claude subscription", () => {
     }) as typeof fetch;
     const errors: string[] = [];
     const models = registry(` ${token}\n`, fetchResponses, errors);
-    const model = models.getModel("anthropic", "claude-sonnet-4-6")!;
+    const model = models.getModel("anthropic", modelId)!;
+    expect(model).toBeDefined();
     const reply = await models.completeSimple(model, {
       systemPrompt: "Play the benchmark game.",
       messages: [{ role: "user", content: "Start", timestamp: 0 }],
@@ -60,6 +61,8 @@ describe("Claude subscription", () => {
     expect(reply.stopReason).toBe("toolUse");
     expect(reply.content).toContainEqual({ type: "toolCall", id: "tool_test", name: "benchmark_action", arguments: { action: "play" } });
     expect(request!.headers.get("authorization")).toBe(`Bearer ${token}`);
+    expect(request!.body.model).toBe(modelId);
+    if (modelId.startsWith("claude-mythos-")) expect(request!.body.fallbacks).toBeUndefined();
     expect(request!.headers.has("x-api-key")).toBe(false);
     expect(request!.headers.get("x-app")).toBe("cli");
     expect(request!.headers.get("anthropic-beta")).toContain("oauth-2025-04-20");

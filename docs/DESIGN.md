@@ -153,10 +153,10 @@ Generate a long-lived access token on your own machine:
 claude setup-token
 ```
 
-Then run the following command and paste only the generated token at Wrangler's secret prompt:
+Set the generated token as `CLAUDE_CODE_OAUTH_TOKEN` in your shell, then upload it:
 
 ```sh
-bunx wrangler secret put CLAUDE_CODE_OAUTH_TOKEN
+bunx cf workers secrets update CLAUDE_CODE_OAUTH_TOKEN --worker krillion-bench --text "$CLAUDE_CODE_OAUTH_TOKEN"
 ```
 
 Deploy the implementation with `bun run deploy`, then try a single Claude run from the admin portal. No new Durable Object or migration is needed. Pi recognizes the `sk-ant-oat...` token and supplies Bearer authentication, Claude Code headers, and its Claude Code system prompt. The benchmark tools remain installed through Pi.
@@ -166,8 +166,10 @@ This is a static access token, not a refresh credential. The Worker does not ren
 To return new runs to gateway billing:
 
 ```sh
-bunx wrangler secret delete CLAUDE_CODE_OAUTH_TOKEN
+bunx cf workers secrets delete CLAUDE_CODE_OAUTH_TOKEN --worker krillion-bench
 ```
+
+The subscription catalog also includes `anthropic/claude-mythos-5.1` and `anthropic/claude-mythos-5.2`, which Pi's pinned catalog omits. Each uses its matching Fable version's Messages settings, limits, and prices, as documented for [Mythos 5.1](https://platform.claude.com/docs/en/models/mythos-5-1/overview) and [Mythos 5.2](https://platform.claude.com/docs/en/models/mythos-5-2/overview). These entries do not request optional fallback models. The production KV roster is separate from `config/models.json`; update both when adding models.
 
 ## 3. Daily flow
 

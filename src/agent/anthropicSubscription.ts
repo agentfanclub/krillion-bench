@@ -10,7 +10,20 @@ declare global {
 }
 
 export const ANTHROPIC_ROSTER_PREFIX = "anthropic/";
-export const anthropicSubscriptionModels = Object.values(ANTHROPIC_MODELS);
+// Pi's catalog omits Mythos. Each version shares its Fable sibling's Messages
+// settings, context/output limits and pricing. Don't request the Fable catalog's
+// optional fallback models for benchmark runs.
+// https://platform.claude.com/docs/en/models/mythos-5-2/overview
+const mythosModels = (["5-1", "5-2"] as const).map((version) => {
+  const base = ANTHROPIC_MODELS[`claude-fable-${version}`];
+  return {
+    ...base,
+    id: `claude-mythos-${version}`,
+    name: `Claude Mythos ${version.replace("-", ".")}`,
+    compat: { ...base.compat, allowedFallbackModels: [] },
+  };
+});
+export const anthropicSubscriptionModels = [...Object.values(ANTHROPIC_MODELS), ...mythosModels];
 
 /** The gateway roster spells versions with dots; Anthropic's native IDs use dashes. */
 export const anthropicRosterId = (id: string): string =>
@@ -27,6 +40,8 @@ export function anthropicSubscriptionProvider(
   const provider: Provider = anthropicProvider();
   return {
     ...provider,
+    getModels: () => anthropicSubscriptionModels,
+    getAllModels: () => anthropicSubscriptionModels,
     auth: {
       apiKey: {
         name: "Claude subscription",
